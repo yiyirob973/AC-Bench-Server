@@ -300,4 +300,474 @@ def classify(table, times_ms):
         bits = []
         for t in tracks:
             norm = table["norms"].get(label, {}).get(t)
-            if norm is not None and norm - deltas[t] > 0.25 *
+            if norm is not None and norm - deltas[t] > 0.25 * table["class_gap"]:
+                bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], norm - deltas[t]))
+        bop = "; ".join(bits)
+    return {"class": label, "score_pct": score, "gap_pct": gap, "deltas": deltas, "variance_pct": variance,
+            "flags": flags, "bop": bop}
+
+
+def publish_classes(db, cfg, include_provisional=False):
+    """Cut a new class table from the merged data (natural breaks via ac_rating) and store it."""
+    wanted = ("verified", "provisional") if include_provisional else ("verified",)
+    per_car = {}
+    for r in db.execute("SELECT car_hash, track, score_ms, status FROM merged"):
+        if r["status"] in wanted:
+            per_car.setdefault(r["car_hash"], {})[r["track"]] = {"status": "ok", "best_ms": r["score_ms"]}
+    results = {h: v for h, v in per_car.items() if all(t in v for t in cfg["tracks"])}
+    if len(results) < 2:
+        raise SystemExit("Not enough cars with complete data (%d). Need at least 2." % len(results))
+    cars, summ = ac_rating.rate(results, cfg["tracks"], class_gap=cfg["class_gap"],
+                                min_size=cfg["min_class_size"], tie_zone=cfg["tie_zone"])
+    order = sorted(cars.values(), key=lambda c: (c["score"], c["id"]))
+    cuts, pos = [], 0
+    for cl in summ["classes"][:-1]:
+        pos += cl["n"]
+        y1, y2 = math.log1p(order[pos - 1]["score"] / 100), math.log1p(order[pos]["score"] / 100)
+        cuts.append(math.expm1((y1 + y2) / 2) * 100)
+    refs = {t: min(v[t]["best_ms"] for v in results.values()) for t in cfg["tracks"]}
+    labels = [class_label(i + 1) for i in range(len(summ["classes"]))]
+    norms = {}
+    for c in order:
+        for ti, t in enumerate(cfg["tracks"]):
+            norms.setdefault(c["cls"], {}).setdefault(t, []).append(c["deltas"][ti])
+    norms = {lab: {t: statistics.median(v) for t, v in d.items()} for lab, d in norms.items()}
+    version = (db.execute("SELECT MAX(version) AS v FROM class_tables").fetchone()["v"] or 0) + 1
+    body = {"version": version, "created": now(), "profile": cfg["profile"], "tracks": cfg["tracks"],
+            "refs_ms": refs, "cuts": cuts, "labels": labels, "norms": norms, "base_score": order[0]["score"],
+            "class_gap": cfg["class_gap"], "tie_zone": cfg["tie_zone"], "n_cars": len(order),
+            "classes": [{"label": c["label"], "n": c["n"], "lo": c["lo"], "hi": c["hi"], "width": c["width"]}
+                        for c in summ["classes"]],
+            "include_provisional": include_provisional}
+    db.execute("INSERT INTO class_tables(version, created, body) VALUES(?,?,?)", (version, now(), json.dumps(body)))
+    bump(db)
+    db.commit()
+    return body, summ
+
+
+_STATUS_RANK = {"disputed": 3, "provisional": 2, "verified": 1}
+
+
+def car_records(db, cfg, only_hash=None):
+    table = latest_table(db)
+    q = "SELECT car_hash, track, score_ms, n_used, n_total, status, updated FROM merged"
+    args = ()
+    if only_hash:
+        q, args = q + " WHERE car_hash=?", (only_hash,)
+    per_car = {}
+    for r in db.execute(q, args):
+        per_car.setdefault(r["car_hash"], {})[r["track"]] = r
+    names = {}
+    for r in db.execute("SELECT car_hash, car_id, name, MAX(created) AS c FROM submissions GROUP BY car_hash"):
+        names[r["car_hash"]] = (r["car_id"], r["name"])
+    out = []
+    for h, per in sorted(per_car.items()):
+        missing = [t for t in cfg["tracks"] if t not in per]
+        sts = [per[t]["status"] for t in per]
+        if "disputed" in sts:
+            status = "disputed"
+        elif missing:
+            status = "incomplete"
+        elif "provisional" in sts:
+            status = "provisional"
+        else:
+            status = "verified"
+        rec = {"car_hash": h, "car_id": names.get(h, ("", ""))[0], "name": names.get(h, ("", ""))[1],
+               "status": status, "times_ms": {t: per[t]["score_ms"] for t in per},
+               "n": {t: per[t]["n_used"] for t in per}, "updated": max(per[t]["updated"] for t in per),
+               "class": None}
+        if table and status in ("verified", "provisional"):
+            rec.update(classify(table, {t: per[t]["score_ms"] for t in table["tracks"]}))
+        out.append(rec)
+    return table, out
+
+
+# ------------------------------------------------------------------ http layer
+def respond(code, obj, extra=None):
+    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+               ("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-store")] + (extra or [])
+    return code, body, headers
+
+
+def serve_file(path, content_type):
+    p = HERE / path
+    if not p.is_file():
+        raise HttpError(404, "not found")
+    body = p.read_bytes()
+    headers = [
+        ("Content-Type", content_type),
+        ("Content-Length", str(len(body))),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Cache-Control", "no-store"),
+    ]
+    return 200, body, headers
+
+
+def client_ip(environ, cfg):
+    if cfg["trust_proxy_header"]:
+        fwd = environ.get("HTTP_X_FORWARDED_FOR", "")
+        if fwd:        # the LAST address is the one your own proxy added; earlier ones are client-controlled
+            return fwd.split(",")[-1].strip()[:64]
+    return environ.get("REMOTE_ADDR", "?")[:64]
+
+
+def read_json(environ, cfg):
+    try:
+        length = int(environ.get("CONTENT_LENGTH") or 0)
+    except ValueError:
+        raise HttpError(400, "bad Content-Length")
+    if length <= 0:
+        raise HttpError(400, "empty body")
+    if length > cfg["max_body_bytes"]:
+        raise HttpError(413, "body too large")
+    raw = environ["wsgi.input"].read(length)
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise HttpError(400, "body is not valid JSON")
+    if not isinstance(data, dict):
+        raise HttpError(400, "body must be a JSON object")
+    return data
+
+
+def authenticate(db, environ):
+    header = environ.get("HTTP_AUTHORIZATION", "")
+    if not header.startswith("Bearer ") or len(header) > 200:
+        raise HttpError(401, "missing API key")
+    user = db.execute("SELECT id, name, role, banned FROM users WHERE key_hash=?", (sha(header[7:].strip()),)).fetchone()
+    if not user:
+        raise HttpError(401, "unknown API key")
+    if user["banned"]:
+        raise HttpError(403, "this account is banned")
+    return user
+
+
+def rate_limit(db, who, kind, limit, window=3600):
+    t = now()
+    n = db.execute("SELECT COUNT(*) AS n FROM events WHERE who=? AND kind=? AND ts>?", (who, kind, t - window)).fetchone()["n"]
+    if n >= limit:
+        raise HttpError(429, "rate limit reached, try again later")
+    db.execute("INSERT INTO events(ts, who, kind) VALUES(?,?,?)", (t, who, kind))
+    if secrets.randbelow(50) == 0:
+        db.execute("DELETE FROM events WHERE ts<?", (t - 86400,))
+    db.commit()
+
+
+def public_config(cfg, db):
+    table = latest_table(db)
+    return {"api": API_VERSION, "profile": cfg["profile"], "tracks": cfg["tracks"], "laps": cfg["laps"],
+            "max_batch": cfg["max_batch"], "min_confirmations": cfg["min_confirmations"],
+            "tolerance_pct": cfg["tolerance_pct"], "env": cfg["env"],
+            "class_table_version": table["version"] if table else None}
+
+
+def handle_register(db, cfg, environ):
+    data = read_json(environ, cfg)
+    rate_limit(db, "ip:" + client_ip(environ, cfg), "register", cfg["rate_register_per_hour"])
+    invite, name = data.get("invite"), data.get("name")
+    if not isinstance(invite, str) or not isinstance(name, str) or not USER_NAME.match(name):
+        raise HttpError(400, "invite and a name of 3-40 letters, digits, . _ - are required")
+    row = db.execute("SELECT role, uses_left FROM invites WHERE code_hash=?", (sha(invite.strip()),)).fetchone()
+    if not row or row["uses_left"] <= 0:
+        raise HttpError(403, "invalid or used-up invite code")
+    key = "acb_" + secrets.token_urlsafe(32)
+    try:
+        db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (name, sha(key), row["role"], now()))
+    except sqlite3.IntegrityError:
+        raise HttpError(409, "that name is taken")
+    db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=?", (sha(invite.strip()),))
+    db.commit()
+    return respond(201, {"api_key": key, "name": name, "role": row["role"]})
+
+
+def handle_submit(db, cfg, environ):
+    user = authenticate(db, environ)
+    rate_limit(db, "user:%d" % user["id"], "submit", cfg["rate_submits_per_hour"])
+    data = read_json(environ, cfg)
+    if data.get("profile") != cfg["profile"]:
+        raise HttpError(422, "baseline profile %r is not accepted (server wants %r)" % (data.get("profile"), cfg["profile"]))
+    if not cfg.get("env"):
+        raise HttpError(503, "server is not configured yet (no canonical environment)")
+    entries = data.get("results")
+    if not isinstance(entries, list) or not entries:
+        raise HttpError(400, "results must be a non-empty list")
+    if len(entries) > cfg["max_entries"]:
+        raise HttpError(413, "at most %d results per upload" % cfg["max_entries"])
+    envs = clean_envs(data.get("environments", {}))
+    table = latest_table(db)
+    refs = table["refs_ms"] if table else None
+    accepted, rejected, touched = 0, [], set()
+    for i, e in enumerate(entries):
+        norm, why = validate_entry(e, cfg, envs, refs)
+        if why:
+            if len(rejected) < 100:
+                rejected.append({"index": i, "car_id": e.get("car_id") if isinstance(e, dict) else None,
+                                 "track": e.get("track") if isinstance(e, dict) else None, "reason": why})
+            continue
+        db.execute(
+            "INSERT INTO submissions(user_id, car_hash, car_id, name, track, score_ms, spread_pct, laps_json, batch, env_id, used, created) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(user_id, car_hash, track) DO UPDATE SET "
+            "car_id=excluded.car_id, name=excluded.name, score_ms=excluded.score_ms, spread_pct=excluded.spread_pct, "
+            "laps_json=excluded.laps_json, batch=excluded.batch, env_id=excluded.env_id, created=excluded.created",
+            (user["id"], norm["car_hash"], norm["car_id"], norm["name"], norm["track"], norm["score_ms"],
+             norm["spread_pct"], json.dumps(norm["laps"]), norm["batch"], norm["env_id"], now()))
+        touched.add((norm["car_hash"], norm["track"]))
+        accepted += 1
+    for h, t in touched:
+        recompute(db, cfg, h, t)
+    if touched:
+        bump(db)
+    db.commit()
+    status = {}
+    for h, t in touched:
+        row = db.execute("SELECT status FROM merged WHERE car_hash=? AND track=?", (h, t)).fetchone()
+        key = row["status"] if row else "none"
+        status[key] = status.get(key, 0) + 1
+    return respond(200, {"accepted": accepted, "rejected": rejected, "rejected_total": len(entries) - accepted,
+                         "merged_status": status})
+
+
+_export_cache = {}
+
+
+def handle_classes(db, cfg, environ):
+    table = latest_table(db)
+    etag = '"%s-%d"' % (table["version"] if table else 0, data_version(db))
+    if environ.get("HTTP_IF_NONE_MATCH") == etag:
+        return 304, b"", [("ETag", etag)]
+    body = _export_cache.get(etag)
+    if body is None:
+        _, cars = car_records(db, cfg)
+        body = json.dumps({"format": 1, "generated": now(), "profile": cfg["profile"], "tracks": cfg["tracks"],
+                           "table": table, "cars": cars}, separators=(",", ":")).encode("utf-8")
+        _export_cache.clear()
+        _export_cache[etag] = body
+    return 200, body, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                       ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", "no-cache")]
+
+
+def route(environ, db_path):
+    db = connect(db_path)
+    try:
+        cfg = get_config(db)
+        method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
+        if method == "GET" and path in ("/", "/stats"):
+            return serve_file("stats.html", "text/html; charset=utf-8")
+        if method == "GET" and path == "/v1/health":
+            return respond(200, {"ok": True, "api": API_VERSION, "time": now()})
+        if method == "GET" and path == "/v1/config":
+            return respond(200, public_config(cfg, db))
+        if method == "POST" and path == "/v1/register":
+            return handle_register(db, cfg, environ)
+        if method == "POST" and path == "/v1/submit":
+            return handle_submit(db, cfg, environ)
+        if method == "GET" and path == "/v1/classes":
+            return handle_classes(db, cfg, environ)
+        m = re.match(r"^/v1/cars/([0-9a-f]{64})$", path)
+        if method == "GET" and m:
+            table, cars = car_records(db, cfg, m.group(1))
+            if not cars:
+                raise HttpError(404, "unknown car")
+            return respond(200, {"car": cars[0], "table_version": table["version"] if table else None})
+        raise HttpError(404, "not found")
+    finally:
+        db.close()
+
+
+def create_app(db_path):
+    init_db(db_path).close()
+
+    def app(environ, start_response):
+        try:
+            code, body, headers = route(environ, db_path)
+        except HttpError as e:
+            code, body, headers = respond(e.code, {"error": e.msg})
+        except Exception as e:           # never leak internals to the client
+            sys.stderr.write("internal error: %r\n" % (e,))
+            code, body, headers = respond(500, {"error": "internal error"})
+        start_response("%d %s" % (code, HTTPStatus(code).phrase), headers)
+        return [body]
+    return app
+
+
+_app = None
+
+
+def application(environ, start_response):
+    """WSGI entry point for gunicorn / waitress:  gunicorn -w 2 server:application  (DB path: ACB_DB)."""
+    global _app
+    if _app is None:
+        _app = create_app(os.environ.get("ACB_DB", "acbench.db"))
+    return _app(environ, start_response)
+
+
+# ------------------------------------------------------------------ admin CLI
+def cmd_serve(args):
+    class Threaded(ThreadingMixIn, WSGIServer):
+        daemon_threads = True
+
+    class Quiet(WSGIRequestHandler):
+        def log_message(self, fmt, *a):
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % a))
+
+    srv = make_server(args.host, args.port, create_app(args.db), server_class=Threaded, handler_class=Quiet)
+    print("serving on http://%s:%d (use a TLS reverse proxy in front of this)" % (args.host, args.port))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_set_env(args, db):
+    data = json.loads(Path(args.source).read_text(encoding="utf-8"))
+    env = None
+    if isinstance(data, list):
+        for entry in reversed(data):
+            if entry.get("status") == "ok" and entry.get("env"):
+                env = entry["env"]
+                break
+    elif isinstance(data, dict):
+        env = data.get("env", data)
+    if not env or not env.get("tracks") or not env.get("acs"):
+        raise SystemExit("No usable environment (tracks digests + acs) found in that file.")
+    cfg = get_config(db)
+    if env.get("profile") and env["profile"] != cfg["profile"]:
+        print("WARNING: file is for profile %r, server is set to %r" % (env["profile"], cfg["profile"]))
+    cfg["env"] = {"tracks": env["tracks"], "acs": env["acs"]}
+    set_config(db, cfg)
+    print("Canonical environment set:", json.dumps(cfg["env"], indent=1))
+    missing = [t.partition("/")[0] for t in cfg["tracks"] if t.partition("/")[0] not in env["tracks"]]
+    if missing:
+        print("WARNING: no digest for track(s):", ", ".join(missing), "(run the check on every baseline track)")
+
+
+def cmd_admin(args):
+    db = init_db(args.db)
+    cfg = get_config(db)
+    c = args.command
+    if c == "init":
+        set_config(db, cfg)
+        print("database ready:", args.db)
+    elif c == "set-env":
+        cmd_set_env(args, db)
+    elif c == "invite":
+        code = secrets.token_urlsafe(9)
+        db.execute("INSERT INTO invites(code_hash, role, uses_left, created) VALUES(?,?,?,?)",
+                   (sha(code), args.role, args.uses, now()))
+        db.commit()
+        print("invite code (shown once): %s   role=%s uses=%d" % (code, args.role, args.uses))
+    elif c == "create-user":
+        key = "acb_" + secrets.token_urlsafe(32)
+        db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (args.name, sha(key), args.role, now()))
+        db.commit()
+        print("API key for %s (shown once): %s" % (args.name, key))
+    elif c == "set-role":
+        row = db.execute("SELECT id FROM users WHERE name=?", (args.name,)).fetchone()
+        if not row:
+            raise SystemExit("no such user")
+        db.execute("UPDATE users SET role=? WHERE id=?", (args.role, row["id"]))
+        keys = db.execute("SELECT DISTINCT car_hash, track FROM submissions WHERE user_id=?", (row["id"],)).fetchall()
+        for k in keys:
+            recompute(db, cfg, k["car_hash"], k["track"])
+        bump(db)
+        db.commit()
+        print("%s is now %s; %d merged entries recomputed" % (args.name, args.role, len(keys)))
+    elif c in ("ban", "unban"):
+        row = db.execute("SELECT id FROM users WHERE name=?", (args.name,)).fetchone()
+        if not row:
+            raise SystemExit("no such user")
+        db.execute("UPDATE users SET banned=? WHERE id=?", (1 if c == "ban" else 0, row["id"]))
+        db.commit()
+        keys = db.execute("SELECT DISTINCT car_hash, track FROM submissions WHERE user_id=?", (row["id"],)).fetchall()
+        for k in keys:
+            recompute(db, cfg, k["car_hash"], k["track"])
+        db.commit()
+        bump(db)
+        db.commit()
+        print("%s: %s, %d merged entries recomputed" % (c, args.name, len(keys)))
+    elif c == "backup":
+        dest = Path(args.to)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        out = sqlite3.connect(str(dest))
+        db.backup(out)
+        out.close()
+        print("backup written:", dest)
+    elif c == "recompute-all":
+        keys = db.execute("SELECT DISTINCT car_hash, track FROM submissions").fetchall()
+        for k in keys:
+            recompute(db, cfg, k["car_hash"], k["track"])
+        bump(db)
+        db.commit()
+        print("recomputed", len(keys))
+    elif c == "publish-classes":
+        body, summ = publish_classes(db, cfg, args.include_provisional)
+        print("class table v%d: %d cars, %d classes" % (body["version"], body["n_cars"], len(body["labels"])))
+        for cl in body["classes"]:
+            print("  %s: %3d cars, rating %.2f%% .. %.2f%%" % (cl["label"], cl["n"], cl["lo"], cl["hi"]))
+        for w in summ["warnings"][:10]:
+            print("WARNING:", w)
+    elif c == "stats":
+        for label, q in (("users", "SELECT COUNT(*) FROM users"), ("banned", "SELECT COUNT(*) FROM users WHERE banned=1"),
+                         ("submissions", "SELECT COUNT(*) FROM submissions"),
+                         ("verified", "SELECT COUNT(*) FROM merged WHERE status='verified'"),
+                         ("provisional", "SELECT COUNT(*) FROM merged WHERE status='provisional'"),
+                         ("disputed", "SELECT COUNT(*) FROM merged WHERE status='disputed'"),
+                         ("class tables", "SELECT COUNT(*) FROM class_tables")):
+            print("%-12s %d" % (label, db.execute(q).fetchone()[0]))
+    elif c == "disputed":
+        for m in db.execute("SELECT car_hash, track FROM merged WHERE status='disputed'"):
+            subs = db.execute("SELECT u.name, s.car_id, s.score_ms FROM submissions s JOIN users u ON u.id=s.user_id "
+                              "WHERE s.car_hash=? AND s.track=?", (m["car_hash"], m["track"])).fetchall()
+            print(m["car_hash"][:12], m["track"], ", ".join("%s=%.0fms" % (s["name"], s["score_ms"]) for s in subs))
+    elif c == "config":
+        if args.action == "get":
+            print(json.dumps(cfg, indent=1))
+        else:
+            if args.key not in DEFAULT_CONFIG:
+                raise SystemExit("unknown key; valid: " + ", ".join(DEFAULT_CONFIG))
+            cfg[args.key] = json.loads(args.value)
+            set_config(db, cfg)
+            print(args.key, "=", json.dumps(cfg[args.key]))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="AC Bench cloud server")
+    ap.add_argument("--db", default=os.environ.get("ACB_DB", "acbench.db"))
+    sub = ap.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("serve")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8080)
+    sub.add_parser("init")
+    s = sub.add_parser("set-env")
+    s.add_argument("--from", dest="source", required=True, help="track_check_log.json or a JSON with tracks + acs")
+    s = sub.add_parser("invite")
+    s.add_argument("--role", choices=["user", "trusted"], default="user")
+    s.add_argument("--uses", type=int, default=1)
+    s = sub.add_parser("create-user")
+    s.add_argument("name")
+    s.add_argument("--role", choices=["user", "trusted"], default="user")
+    for n in ("ban", "unban"):
+        sub.add_parser(n).add_argument("name")
+    s = sub.add_parser("set-role")
+    s.add_argument("name")
+    s.add_argument("--role", choices=["user", "trusted"], required=True)
+    sub.add_parser("recompute-all")
+    sub.add_parser("backup").add_argument("--to", required=True, help="file to write a consistent copy of the database to")
+    s = sub.add_parser("publish-classes")
+    s.add_argument("--include-provisional", action="store_true")
+    sub.add_parser("stats")
+    sub.add_parser("disputed")
+    s = sub.add_parser("config")
+    s.add_argument("action", choices=["get", "set"])
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    args = ap.parse_args()
+    if args.command == "serve":
+        cmd_serve(args)
+    else:
+        cmd_admin(args)
+
+
+if __name__ == "__main__":
+    main()
