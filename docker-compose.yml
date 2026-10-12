@@ -1,10 +1,18 @@
-# From this folder (cloud_server/):   docker compose up -d --build
-# Your reverse proxy (with your SSL certificate) forwards https://<your domain> to this container, see README.md.
+# AC Bench Cloud Server - Docker Compose Configuration
+# GitHub repository: https://github.com/yiyirob973/AC-Bench-Server
+#
+# Quick start:
+#   mkdir ac-bench && cd ac-bench
+#   docker compose -f docker-compose.yml up -d --build
+#
+# The compose file will automatically pull the repository and build the image.
+# Your reverse proxy (with your SSL certificate) forwards https://<your domain> to this container.
+
 services:
   acbench:
     build:
-      context: ..                          # the ac_bench folder
-      dockerfile: cloud_server/Dockerfile
+      context: https://github.com/yiyirob973/AC-Bench-Server.git
+      dockerfile: Dockerfile
     image: acbench-server:latest
     container_name: acbench
     restart: unless-stopped
