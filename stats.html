@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AC Bench Stats</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f3f5f8;
+      --panel: #ffffff;
+      --panel-alt: #eef2f6;
+      --ink: #1b2433;
+      --muted: #58677c;
+      --line: #d8dee8;
+      --accent: #0d7d6f;
+      --accent-ink: #ffffff;
+      --warn: #9a5a0a;
+      --shadow: rgba(15, 23, 42, 0.08);
+      --font: Bahnschrift, "DIN Alternate", "Segoe UI Variable", system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #10161d;
+        --panel: #171f2a;
+        --panel-alt: #1d2937;
+        --ink: #ebf1f7;
+        --muted: #a0acbf;
+        --line: #2f3d4d;
+        --accent: #4ed2bf;
+        --accent-ink: #062720;
+        --warn: #f0b366;
+        --shadow: rgba(0, 0, 0, 0.25);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.45 var(--font);
+      font-variant-numeric: tabular-nums;
+    }
+    .wrap {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 30px 18px 80px;
+    }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 3vw, 2.8rem);
+      line-height: 1.1;
+      letter-spacing: 0.2px;
+    }
+    .lede {
+      color: var(--muted);
+      margin-top: 8px;
+      max-width: 72ch;
+    }
+    .panel {
+      margin-top: 18px;
+      padding: 18px 18px 16px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 8px 18px var(--shadow);
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 1.1rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+    }
+    .stat {
+      background: var(--panel-alt);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .value {
+      font-size: clamp(1.4rem, 2vw, 2rem);
+      font-weight: 700;
+      margin-top: 6px;
+      color: var(--accent);
+    }
+    .warning {
+      color: var(--warn);
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+    .footer {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 0.84rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AC Bench Stats</h1>
+    <p class="lede">Live class-table and server health information for the AC Bench benchmark backend.</p>
+
+    <section class="panel">
+      <h2>Server health</h2>
+      <div class="grid">
+        <div class="stat">
+          <div class="label">Status</div>
+          <div id="status" class="value">Loading…</div>
+        </div>
+        <div class="stat">
+          <div class="label">API version</div>
+          <div id="api-version" class="value">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Profile</div>
+          <div id="profile" class="value">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Dataset summary</h2>
+      <div class="grid">
+        <div class="stat">
+          <div class="label">Users</div>
+          <div id="users" class="value">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Submissions</div>
+          <div id="submissions" class="value">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Verified</div>
+          <div id="verified" class="value">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Disputed</div>
+          <div id="disputed" class="value">—</div>
+        </div>
+        <div class="stat">
+          <div class="label">Class tables</div>
+          <div id="class-tables" class="value">—</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="footer">
+      Data source: <a href="/v1/config">/v1/config</a> · <a href="/v1/health">/v1/health</a>
+    </div>
+  </div>
+
+  <script>
+    async function loadStats() {
+      const statusEl = document.getElementById('status');
+      const apiVersionEl = document.getElementById('api-version');
+      const profileEl = document.getElementById('profile');
+
+      try {
+        const health = await fetch('/v1/health');
+        const config = await fetch('/v1/config');
+
+        if (!health.ok || !config.ok) {
+          throw new Error('Bad response');
+        }
+
+        const healthJson = await health.json();
+        const configJson = await config.json();
+
+        statusEl.textContent = healthJson.ok ? 'Online' : 'Unavailable';
+        statusEl.classList.remove('warning');
+        apiVersionEl.textContent = healthJson.api ?? '—';
+        profileEl.textContent = configJson.profile ?? '—';
+
+        const stats = await fetch('/v1/classes');
+        if (stats.ok) {
+          const statsJson = await stats.json();
+          document.getElementById('users').textContent = statsJson.cars ? statsJson.cars.length : '—';
+          document.getElementById('submissions').textContent = statsJson.cars ? statsJson.cars.reduce((n, c) => n + (c.n || 0), 0) : '—';
+          document.getElementById('verified').textContent = statsJson.cars ? statsJson.cars.filter(c => c.status === 'verified').length : '—';
+          document.getElementById('disputed').textContent = statsJson.cars ? statsJson.cars.filter(c => c.status === 'disputed').length : '—';
+          document.getElementById('class-tables').textContent = statsJson.table ? statsJson.table.version ?? '—' : '—';
+        }
+      } catch (err) {
+        statusEl.textContent = 'Offline';
+        statusEl.classList.add('warning');
+        apiVersionEl.textContent = '—';
+        profileEl.textContent = '—';
+      }
+    }
+
+    loadStats();
+    setInterval(loadStats, 30000);
+  </script>
+</body>
+</html>
