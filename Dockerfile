@@ -1,11 +1,6 @@
-# Build from the ac_bench folder (the parent of cloud_server):
-#   docker build -f cloud_server/Dockerfile -t acbench-server .
-#   docker run -d --name acbench -p 127.0.0.1:8080:8080 -v acbench-data:/data acbench-server
-# Put a TLS reverse proxy (Caddy / nginx) in front; never expose port 8080 directly.
 FROM python:3.12-slim
 WORKDIR /app
-COPY ac_rating.py ac_car_classifier.py /app/
-COPY server.py /app/server.py
+COPY ac_rating.py ac_car_classifier.py server.py stats.html selftest.py backup.sh /app/
 RUN pip install --no-cache-dir gunicorn \
  && useradd --create-home acb && mkdir /data && chown acb /data
 ENV ACB_DB=/data/acbench.db
