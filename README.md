@@ -127,37 +127,47 @@ This keeps the server auditable and easy to run without a large infrastructure s
 - the database should be backed up regularly
 - the server is meant to sit behind a TLS reverse proxy; do not expose raw port 8080 publicly
 
-## Docker deployment
+## Docker / Compose deployment
 
-The repository includes a Docker setup for running the server.
+The recommended deployment is Docker Compose. The compose file builds the server directly from the GitHub repository, so you do not need a nested repo structure or a local checkout of the full server code.
 
-### Local test
+### Option 1: Download the compose file and run it
 
 ```bash
-python selftest.py
-python server.py init
-python server.py set-env --from track_check_log.json
-python server.py invite --role user --uses 20
-python server.py serve --port 8080
+mkdir acbench-server && cd acbench-server
+curl -L https://raw.githubusercontent.com/yiyirob973/AC-Bench-Server/main/docker-compose.yml -o docker-compose.yml
+docker compose up -d --build
 ```
 
-Then open the stats page at:
+Then open:
 
 ```text
+http://127.0.0.1:8080/
 http://127.0.0.1:8080/stats
+```
+
+### Option 2: Clone the repo and run locally
+
+```bash
+git clone https://github.com/yiyirob973/AC-Bench-Server.git
+cd AC-Bench-Server
+docker compose up -d --build
+```
+
+This uses the repository's `Dockerfile` and exposes the app on port 8080. The compose file keeps the database in a Docker volume and mounts `./import` as read-only so you can drop files like `track_check_log.json` into it before running administrative commands.
+
+### Useful commands
+
+```bash
+docker compose logs -f acbench
+docker compose ps
+docker compose down
+docker volume inspect acbench-data
 ```
 
 ### Production-style run
 
-```bash
-docker build -t acbench-server .
-docker run -d --name acbench -p 127.0.0.1:8080:8080 -v acbench-data:/data acbench-server
-docker exec acbench python server.py init
-docker exec -it acbench python server.py set-env --from /data/track_check_log.json
-docker exec acbench python server.py invite --role user --uses 20
-```
-
-The public dashboard is available at `/stats`, and the API remains under `/v1/*`.
+For real deployments, keep the container behind a reverse proxy that terminates TLS. The server itself should not be exposed directly on port 8080 unless you are only testing locally.
 
 ## Server admin commands
 
