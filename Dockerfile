@@ -5,7 +5,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY ac_rating.py ac_car_classifier.py /app/
-COPY cloud_server/server.py /app/server.py
+COPY server.py /app/server.py
 RUN pip install --no-cache-dir gunicorn \
  && useradd --create-home acb && mkdir /data && chown acb /data
 ENV ACB_DB=/data/acbench.db
