@@ -1,8 +1,12 @@
 # AC Bench Server
 
-This repository contains the cloud backend for AC Bench. It accepts benchmark submissions from the desktop app, validates them, merges user results, and publishes versioned class tables that clients can download.
+The cloud backend for AC Bench. Validates benchmark submissions, reconciles results from multiple users, and publishes versioned car class tables.
 
-The desktop app is the benchmarking client. It runs on Windows, validates the vanilla track setup, benchmarks cars with AI-controlled laps, and uploads the results to this server. The server is the trust layer: it checks the environment, recomputes the score, verifies agreement between users, and publishes the class table.
+## For most users
+
+If you want to benchmark cars, start with the **[AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop)**. It's the client-side tool you run locally on Windows.
+
+This repository is the server backend. You only need to run this if you want to operate a shared class database and publish results to a community.
 
 ## What the server does
 
@@ -14,33 +18,23 @@ The desktop app is the benchmarking client. It runs on Windows, validates the va
 - Publishes versioned class tables for the desktop app to consume
 - Stores database backups and server configuration for operator maintenance
 
-## The desktop-to-server flow
+## The workflow
 
-The desktop app does the benchmark work. The server does the verification and publishing.
-
-1. The desktop app benchmarks cars on fixed vanilla tracks using the AC Bench profile.
-2. It computes lap times, tracks metadata, and environment attestation data.
-3. The user uploads the result set to the server with a valid API key.
-4. The server checks:
-   - API key is valid and not banned
-   - profile matches the accepted baseline
-   - track is part of the configured benchmark set
-   - environment matches the canonical vanilla reference
-   - lap data is plausible and consistent
-5. The server recomputes score values and merges submissions by car and track.
-6. Verified data is used to generate or refresh class tables.
-7. The desktop app downloads a new class table and updates class assignments locally.
-
-This separation keeps the desktop app focused on measurement while the server becomes the authoritative source for shared class data.
+1. Users run the desktop app to benchmark cars on fixed vanilla tracks
+2. The desktop app uploads results to this server with a valid API key
+3. The server validates the submission against the canonical environment
+4. The server recomputes scores and merges data from multiple users
+5. The server publishes a versioned class table
+6. Users download the table and see cars assigned to classes
 
 ## Server responsibilities in detail
 
 ### Accounts and access
 
 - Invite-only registration
-- One-time invite codes are issued by the operator
-- Accounts have roles such as `user` and `trusted`
-- API keys are stored as hashes, never as plain text
+- One-time invite codes issued by the operator
+- Accounts have roles: `user` or `trusted`
+- API keys stored as hashes, never plain text
 - Banned users are rejected from uploads
 
 ### Car identity
@@ -48,7 +42,7 @@ This separation keeps the desktop app focused on measurement while the server be
 Car identity is based on the installed car physics, not the folder name.
 
 The server hashes:
-- `data.acd` or `data/`
+- `data.acd` or `data/` (all files)
 - `collider.ini`
 
 This prevents a renamed or updated car mod from inheriting a previous rating by name alone.
@@ -57,12 +51,12 @@ This prevents a renamed or updated car mod from inheriting a previous rating by 
 
 Every upload includes an environment attestation. The server only accepts submissions from a canonical, operator-approved vanilla environment.
 
-That canonical environment includes:
+The canonical environment includes:
 - track digests for the accepted benchmark tracks
 - `acs.exe` hash
 - benchmark baseline profile id
 
-This is how the server prevents users from uploading results made under a different setup or modified game state.
+This prevents users from uploading results made under a different setup or modified game state.
 
 ### Validation rules
 
@@ -78,11 +72,7 @@ The score is always recomputed on the server. Client-reported values are not tru
 
 ### Agreement and merged status
 
-The server groups submissions by:
-- car hash
-- track
-
-Then it measures agreement between users.
+The server groups submissions by car hash and track, then measures agreement between users.
 
 Status outcomes:
 - `verified`: enough independent agreement or a trusted user confirms it
@@ -230,27 +220,8 @@ cloud_server/
   import/
 ```
 
-## Relationship to the desktop app
-
-This server is not a standalone benchmarking tool. It is the backend for the AC Bench desktop app.
-
-The desktop app is responsible for:
-- benchmarking cars on fixed vanilla tracks
-- validating the environment
-- collecting lap data and classing cars
-- generating class tables and campaign metadata
-- uploading the results to this API
-
-This server is responsible for:
-- proving the environment is valid
-- validating uploads
-- merging and reconciling results from multiple users
-- publishing trusted, versioned class tables
-
-In other words: the desktop app measures; the server validates and agrees.
-
 ## Summary
 
-AC Bench Server is the authority layer for the AC Bench ecosystem. It gives the desktop app a trustworthy way to share benchmark results, reconcile competing submissions, and publish shared class data across a community without exposing the project to anonymous or untrusted uploads.
+AC Bench Server is the validation and publication backend for the AC Bench ecosystem. It gives the desktop app a trustworthy way to share benchmark results, reconcile competing submissions, and publish shared class data across a community without exposing the project to anonymous or untrusted uploads.
 
-This is the backend component of the AC Bench system; the desktop app and the Lua in-game logger are the client-side measurement tools that feed it.
+For most users, start with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop).
