@@ -1,24 +1,39 @@
 # AC Bench Server
 
-The cloud backend for AC Bench. Validates benchmark submissions, reconciles results from multiple users, and publishes versioned car class tables.
+The cloud backend for AC Bench. It validates benchmark submissions, recomputes lap scores, merges community results, and publishes versioned class tables for the desktop app.
 
 ## For most users
 
-If you want to benchmark cars, start with the **[AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop)**. It's the client-side tool you run locally on Windows.
+If you want to benchmark cars, start with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop).
 
-This repository is the server backend. You only need to run this if you want to operate a shared class database and publish results to a community.
+This repository is the server backend. It is only needed if you are operating the shared class database or hosting the public benchmark service.
+
+## Public access after deployment
+
+Once the server is running, the public dashboard is available here:
+
+- `http://<server-host>/`
+- `http://<server-host>/stats`
+
+The dashboard is a static HTML page served from the server root and is intended for operator-facing monitoring.
+
+The JSON API remains under:
+
+- `http://<server-host>/v1/health`
+- `http://<server-host>/v1/config`
+- `http://<server-host>/v1/classes`
 
 ## What the server does
 
 - Accepts invite-only account registrations
 - Validates uploaded benchmark submissions
-- Verifies the benchmark environment against a canonical, tracked reference
+- Verifies the benchmark environment against a canonical tracked reference
 - Recomputes lap scores on the server instead of trusting the client
 - Merges submissions from multiple users into one agreed result per car and track
 - Publishes versioned class tables for the desktop app to consume
 - Stores database backups and server configuration for operator maintenance
 
-## The workflow
+## Workflow
 
 1. Users run the desktop app to benchmark cars on fixed vanilla tracks
 2. The desktop app uploads results to this server with a valid API key
@@ -49,10 +64,10 @@ This prevents a renamed or updated car mod from inheriting a previous rating by 
 
 ### Environment validation
 
-Every upload includes an environment attestation. The server only accepts submissions from a canonical, operator-approved vanilla environment.
+Every upload includes an environment attestation. The server only accepts submissions from a canonical operator-approved vanilla environment.
 
 The canonical environment includes:
-- track digests for the accepted benchmark tracks
+- track digests for accepted benchmark tracks
 - `acs.exe` hash
 - benchmark baseline profile id
 
@@ -126,17 +141,23 @@ python server.py invite --role user --uses 20
 python server.py serve --port 8080
 ```
 
+Then open the stats page at:
+
+```text
+http://127.0.0.1:8080/stats
+```
+
 ### Production-style run
 
 ```bash
-docker build -f cloud_server/Dockerfile -t acbench-server .
+docker build -t acbench-server .
 docker run -d --name acbench -p 127.0.0.1:8080:8080 -v acbench-data:/data acbench-server
 docker exec acbench python server.py init
 docker exec -it acbench python server.py set-env --from /data/track_check_log.json
 docker exec acbench python server.py invite --role user --uses 20
 ```
 
-A reverse proxy such as Caddy or nginx should terminate TLS in front of the app.
+The public dashboard is available at `/stats`, and the API remains under `/v1/*`.
 
 ## Server admin commands
 
@@ -173,6 +194,8 @@ The server exposes a small JSON API.
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/` | Static stats dashboard |
+| `GET` | `/stats` | Static stats dashboard |
 | `GET` | `/v1/health` | Liveness check |
 | `GET` | `/v1/config` | Accepted profile, limits, canonical environment, version info |
 | `POST` | `/v1/register` | Register with an invite code |
@@ -185,7 +208,7 @@ Upload payloads include:
 - `environments`
 - `results`
 
-Server response includes accepted and rejected entries, with reasons for rejections.
+Server responses include accepted and rejected entries, with reasons for rejections.
 
 ## Privacy and data handling
 
@@ -210,15 +233,18 @@ Rate-limit events are short-lived and are purged after a period of time.
 ## Repository layout
 
 ```text
-cloud_server/
-  Dockerfile
-  README.md
-  backup.sh
-  docker-compose.yml
-  selftest.py
-  server.py
-  import/
+README.md
+Dockerfile
+server.py
+stats.html
+selftest.py
 ```
+
+This repository is intentionally kept lean: server code and the public dashboard live at the root level, without a nested cloud_server directory.
+
+## Relationship to the desktop app
+
+The desktop app remains the main user-facing tool for benchmark runs and car analysis. This repo is the backend service that validates submissions, merges them, and publishes class tables.
 
 ## Summary
 
