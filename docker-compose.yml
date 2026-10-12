@@ -1,0 +1,41 @@
+# From this folder (cloud_server/):   docker compose up -d --build
+# Your reverse proxy (with your SSL certificate) forwards https://<your domain> to this container, see README.md.
+services:
+  acbench:
+    build:
+      context: ..                          # the ac_bench folder
+      dockerfile: cloud_server/Dockerfile
+    image: acbench-server:latest
+    container_name: acbench
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"              # only this host can reach it; the proxy runs here. Remove this and use
+                                           # a shared docker network instead if your proxy is in another container.
+    environment:
+      ACB_DB: /data/acbench.db
+    volumes:
+      - acbench-data:/data                 # the database and backups
+      - ./import:/import:ro                # files you give the server (track_check_log.json for set-env)
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    pids_limit: 200
+    # Traefik instead of publishing a port: remove "ports", join your proxy network and uncomment
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.acbench.rule=Host(`acbench.example.org`)
+    #   - traefik.http.routers.acbench.entrypoints=websecure
+    #   - traefik.http.routers.acbench.tls=true
+    #   - traefik.http.services.acbench.loadbalancer.server.port=8080
+    # networks: [proxy]
+
+volumes:
+  acbench-data:
+
+# networks:
+#   proxy:
+#     external: true
