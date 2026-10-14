@@ -7,15 +7,24 @@ submissions from different users into one agreed time per car and track, and pub
 for download. Standard library only (WSGI + SQLite). Put it behind a TLS reverse proxy.
 
 Run
-  python server.py init                          create the database
-  python server.py set-env --from track_check_log.json   canonical vanilla environment (see README)
-  python server.py invite --role user --uses 20  print an invite code
-  python server.py serve --port 8080             small deployments; production: gunicorn server:application
+  python server.py init                                   create the database
+  python server.py set-env --from track_check_log.json    canonical vanilla environment (see README)
+  python server.py invite --role user --uses 20           print an invite code
+  python server.py serve --port 8080                      small deployments; production: gunicorn server:application
+
 Operate
-  python server.py publish-classes               cut a new class table from the verified data
+  python server.py publish-classes                        cut a new class table from the verified data
   python server.py stats | disputed | ban NAME | unban NAME | config get|set KEY VALUE | recompute-all
-  python server.py set-role NAME --role trusted|user   a trusted user's submissions verify on their own
-  python server.py backup --to /data/backups/acbench-2026-01-01.db     consistent copy while running
+  python server.py set-role NAME --role trusted|user      a trusted user's submissions verify on their own
+  python server.py backup --to /data/backups/acbench-2026-01-01.db    consistent copy while running
+
+Admin web UI
+  /admin (PocketID / OpenID Connect login) does the same operator jobs in a browser, and edits the benchmark
+  conditions; see admin.py for the ACB_OIDC_* / ACB_ADMIN_* environment variables.
+
+Benchmark conditions (public, no key needed)
+  GET /v1/conditions  profile, tracks, laps, batch limit, free-form "conditions" and the reference environment
+                      the server will accept; has an ETag, so clients can revalidate with If-None-Match.
 
 What the server checks (a submission entry is rejected, with a reason, unless all hold)
   - valid API key (created from an invite), not banned, within the rate limit
@@ -23,6 +32,7 @@ What the server checks (a submission entry is rejected, with a reason, unless al
   - environment attestation matches the canonical one: the vanilla track digests and the acs.exe hash
   - lap data is plausible and consistent; the score is recomputed here (median of the timed laps),
     the client's own numbers are never trusted
+
 What the server does with it
   - one entry per user per car per track (a new upload replaces your old one)
   - car identity is the hash of the car's physics files, not its folder name
@@ -32,35 +42,39 @@ What the server does with it
   - classes come from a versioned class table: reference times + cut points fixed at publish time,
     so a car's class does not move when other cars are added. Publish a new table deliberately.
 """
-import argparse, bisect, hashlib, json, math, os, re, secrets, sqlite3, statistics, sys, time
+
+import argparse, bisect, hashlib, json, math, os, re, secrets, sqlite3, statistics, sys, threading, time
 from http import HTTPStatus
 from pathlib import Path
 from socketserver import ThreadingMixIn
+from types import SimpleNamespace
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 HERE = Path(__file__).resolve().parent
-for _p in (HERE.parent, HERE):          # share ac_rating.py / ac_car_classifier.py with the desktop tool
+for _p in (HERE.parent, HERE):  # share ac_rating.py / ac_car_classifier.py with the desktop tool
     sys.path.insert(0, str(_p))
-import ac_rating                          # noqa: E402
+import ac_rating  # noqa: E402
+import admin  # noqa: E402
 from ac_car_classifier import class_label  # noqa: E402
 
 API_VERSION = 1
-
 DEFAULT_CONFIG = {
-    "profile": "baseline-v2",                      # baseline profile id the server accepts
+    "profile": "baseline-v2",           # baseline profile id the server accepts
     "tracks": ["magione", "ks_vallelunga/club_circuit"],
-    "laps": 4,                                     # recorded laps per car: lap 1 + the timed laps
-    "max_batch": 1,                                # cars sharing the track in the benchmark race (1 = cleanest)
-    "tolerance_pct": 0.5,                          # submissions agree if within this % of each other
-    "min_confirmations": 2,                        # distinct users that must agree (trusted users count alone)
-    "spread_limit_pct": 1.5,                       # max (slowest - fastest) / median over the timed laps
+    "laps": 4,                          # recorded laps per car: lap 1 + the timed laps
+    "max_batch": 1,                     # cars sharing the track in the benchmark race (1 = cleanest)
+    "tolerance_pct": 0.5,               # submissions agree if within this % of each other
+    "min_confirmations": 2,             # distinct users that must agree (trusted users count alone)
+    "spread_limit_pct": 1.5,            # max (slowest - fastest) / median over the timed laps
     "plaus_min_ms": 20000, "plaus_max_ms": 900000,  # absolute lap time bounds until a class table exists
-    "plaus_low": 0.4, "plaus_high": 6.0,           # bounds as multiples of the class-table reference time
+    "plaus_low": 0.4, "plaus_high": 6.0,            # bounds as multiples of the class-table reference time
     "max_entries": 500, "max_body_bytes": 2000000,
     "rate_submits_per_hour": 20, "rate_register_per_hour": 10,
-    "trust_proxy_header": False,                   # honour X-Forwarded-For (only behind your own proxy)
-    "class_gap": 2.0, "min_class_size": 3, "tie_zone": 0.10,   # class table settings (see ac_rating.py)
-    "env": None,                                   # canonical {"tracks": {track: digest}, "acs": sha256}
+    "trust_proxy_header": False,        # honour X-Forwarded-For (only behind your own proxy)
+    "class_gap": 2.0, "min_class_size": 3, "tie_zone": 0.10,  # class table settings (see ac_rating.py)
+    "env": None,                        # canonical {"tracks": {track: digest}, "acs": sha256}
+    "conditions": {},                   # free-form benchmark conditions served to clients (weather, time, ...)
+    "export_max_age": 30,               # seconds the /v1/classes export may lag behind new uploads (0 = always fresh)
 }
 
 SCHEMA = """
@@ -81,9 +95,14 @@ CREATE TABLE IF NOT EXISTS merged (
   car_hash TEXT NOT NULL, track TEXT NOT NULL, score_ms REAL NOT NULL, n_used INTEGER NOT NULL,
   n_total INTEGER NOT NULL, spread_pct REAL NOT NULL, status TEXT NOT NULL, updated INTEGER NOT NULL,
   PRIMARY KEY (car_hash, track));
+CREATE TABLE IF NOT EXISTS cars (
+  car_hash TEXT PRIMARY KEY, car_id TEXT NOT NULL, name TEXT NOT NULL, updated INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS users_created ON users (created, id);
+CREATE INDEX IF NOT EXISTS merged_status ON merged (status, updated);
 CREATE TABLE IF NOT EXISTS class_tables (version INTEGER PRIMARY KEY, created INTEGER NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, who TEXT NOT NULL, kind TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ev_idx ON events (who, kind, ts);
+CREATE INDEX IF NOT EXISTS ev_ts ON events (ts);
 """
 
 CAR_ID = re.compile(r"^[A-Za-z0-9_.\- ]{1,80}$")
@@ -93,6 +112,7 @@ USER_NAME = re.compile(r"^[A-Za-z0-9_.\-]{3,40}$")
 
 
 # ------------------------------------------------------------------ helpers
+
 def now():
     return int(time.time())
 
@@ -111,7 +131,11 @@ def connect(path):
 
 def init_db(path):
     db = connect(path)
-    db.executescript(SCHEMA)
+    db.executescript(SCHEMA + admin.SCHEMA)
+    if db.execute("SELECT 1 FROM cars LIMIT 1").fetchone() is None and db.execute("SELECT 1 FROM submissions LIMIT 1").fetchone():
+        # existing database from before the cars table: take each car's most recent submission's names (one-time scan)
+        db.execute("INSERT OR IGNORE INTO cars(car_hash, car_id, name, updated) "
+                   "SELECT car_hash, car_id, name, MAX(created) FROM submissions GROUP BY car_hash")
     db.commit()
     return db
 
@@ -157,6 +181,7 @@ class HttpError(Exception):
 
 
 # ------------------------------------------------------------------ validation
+
 def check_env(env, cfg, track):
     canon = cfg.get("env")
     if not canon:
@@ -168,7 +193,10 @@ def check_env(env, cfg, track):
     if env.get("ignore_ui"):
         return "environment was checked with UI files ignored"
     tid = track.partition("/")[0]
-    if (env.get("tracks") or {}).get(tid) != (canon.get("tracks") or {}).get(tid):
+    want = (canon.get("tracks") or {}).get(tid)
+    if not want:
+        return "server has no reference digest for track %s yet" % tid
+    if (env.get("tracks") or {}).get(tid) != want:
         return "track %s is not identical to the vanilla reference" % tid
     if env.get("acs") != canon.get("acs"):
         return "game executable (acs.exe) differs from the reference"
@@ -185,7 +213,7 @@ def clean_envs(envs):
             raise HttpError(400, "bad environment entry")
         tr = v.get("tracks")
         if not isinstance(tr, dict) or len(tr) > 20 or not all(isinstance(a, str) and isinstance(b, str)
-                                                               for a, b in tr.items()):
+                                                                for a, b in tr.items()):
             raise HttpError(400, "bad environment tracks")
         out[k] = {"profile": v.get("profile") if isinstance(v.get("profile"), str) else None,
                   "ignore_ui": bool(v.get("ignore_ui")), "tracks": tr,
@@ -243,42 +271,62 @@ def validate_entry(e, cfg, envs, refs):
 
 
 # ------------------------------------------------------------------ merge
+
 def recompute(db, cfg, car_hash, track):
-    """Agreement between users for one car on one track. Updates submissions.used and merged."""
+    """Agreement between users for one car on one track. Updates submissions.used and merged.
+
+    Picks the biggest group of submissions that agree with each other (ties: the tightest, then the first row).
+    Done on the sorted scores with binary search, O(n log n) instead of comparing every pair."""
     rows = db.execute(
-        "SELECT s.id, s.score_ms, u.role FROM submissions s JOIN users u ON u.id = s.user_id "
+        "SELECT s.id, s.score_ms, s.used, u.role FROM submissions s JOIN users u ON u.id = s.user_id "
         "WHERE s.car_hash=? AND s.track=? AND u.banned=0", (car_hash, track)).fetchall()
     if not rows:
         db.execute("DELETE FROM merged WHERE car_hash=? AND track=?", (car_hash, track))
         return
     tol = cfg["tolerance_pct"] / 100
-    best, best_key = [], None
-    for centre in rows:       # the biggest group of submissions that agree with each other (ties: the tightest)
-        cluster = [r for r in rows if abs(r["score_ms"] - centre["score_ms"]) <= tol * centre["score_ms"]]
-        key = (len(cluster), -(max(r["score_ms"] for r in cluster) - min(r["score_ms"] for r in cluster)))
+    ordered = sorted(rows, key=lambda r: r["score_ms"])
+    scores = [r["score_ms"] for r in ordered]
+    n = len(scores)
+    best_key, best_span = None, (0, 0)
+    for centre in rows:  # original row order, so ties resolve exactly as before
+        c = centre["score_ms"]
+        t_ = tol * c
+        lo, hi = bisect.bisect_left(scores, c - t_), bisect.bisect_right(scores, c + t_)
+        while lo > 0 and abs(scores[lo - 1] - c) <= t_:  # settle float rounding at the edges: exact same test as
+            lo -= 1                                       # abs(score - c) <= tol * c
+        while lo < hi and abs(scores[lo] - c) > t_:
+            lo += 1
+        while hi < n and abs(scores[hi] - c) <= t_:
+            hi += 1
+        while hi > lo and abs(scores[hi - 1] - c) > t_:
+            hi -= 1
+        key = (hi - lo, -(scores[hi - 1] - scores[lo]))
         if best_key is None or key > best_key:
-            best, best_key = cluster, key
-    used = {r["id"] for r in best}
-    trusted = any(r["role"] == "trusted" for r in best)
-    if len(best) >= cfg["min_confirmations"] or trusted:
+            best_key, best_span = key, (lo, hi)
+    cluster = ordered[best_span[0]:best_span[1]]
+    used = {r["id"] for r in cluster}
+    trusted = any(r["role"] == "trusted" for r in cluster)
+    if len(cluster) >= cfg["min_confirmations"] or trusted:
         status = "verified"
     elif len(rows) == 1:
         status = "provisional"
     else:
         status = "disputed"
-    scores = [r["score_ms"] for r in best]
-    spread = (max(scores) - min(scores)) / statistics.median(scores) * 100
-    for r in rows:
-        db.execute("UPDATE submissions SET used=? WHERE id=?", (1 if r["id"] in used else 0, r["id"]))
+    cl_scores = [r["score_ms"] for r in cluster]
+    spread = (max(cl_scores) - min(cl_scores)) / statistics.median(cl_scores) * 100
+    changed = [(1 if r["id"] in used else 0, r["id"]) for r in rows if r["used"] != (1 if r["id"] in used else 0)]
+    if changed:
+        db.executemany("UPDATE submissions SET used=? WHERE id=?", changed)
     db.execute(
         "INSERT INTO merged(car_hash, track, score_ms, n_used, n_total, spread_pct, status, updated) "
         "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(car_hash, track) DO UPDATE SET score_ms=excluded.score_ms, "
         "n_used=excluded.n_used, n_total=excluded.n_total, spread_pct=excluded.spread_pct, "
         "status=excluded.status, updated=excluded.updated",
-        (car_hash, track, statistics.median(scores), len(best), len(rows), spread, status, now()))
+        (car_hash, track, statistics.median(cl_scores), len(cluster), len(rows), spread, status, now()))
 
 
 # ------------------------------------------------------------------ classes
+
 def classify(table, times_ms):
     """times_ms: {track: score_ms}. Class, gap and flags from the fixed class table."""
     tracks = table["tracks"]
@@ -297,12 +345,12 @@ def classify(table, times_ms):
             flags.append("borderline %s/%s (%.2f%%)" % (class_label(k + 1), class_label(k + 2), dist))
     if variance > table["class_gap"]:
         flags.append("high variance (%.1f%%)" % variance)
-        bits = []
-        for t in tracks:
-            norm = table["norms"].get(label, {}).get(t)
-            if norm is not None and norm - deltas[t] > 0.25 * table["class_gap"]:
-                bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], norm - deltas[t]))
-        bop = "; ".join(bits)
+    bits = []
+    for t in tracks:
+        norm = table["norms"].get(label, {}).get(t)
+        if norm is not None and norm - deltas[t] > 0.25 * table["class_gap"]:
+            bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], norm - deltas[t]))
+    bop = "; ".join(bits)
     return {"class": label, "score_pct": score, "gap_pct": gap, "deltas": deltas, "variance_pct": variance,
             "flags": flags, "bop": bop}
 
@@ -358,7 +406,7 @@ def car_records(db, cfg, only_hash=None):
     for r in db.execute(q, args):
         per_car.setdefault(r["car_hash"], {})[r["track"]] = r
     names = {}
-    for r in db.execute("SELECT car_hash, car_id, name, MAX(created) AS c FROM submissions GROUP BY car_hash"):
+    for r in db.execute("SELECT car_hash, car_id, name FROM cars" + (" WHERE car_hash=?" if only_hash else ""), args):
         names[r["car_hash"]] = (r["car_id"], r["name"])
     out = []
     for h, per in sorted(per_car.items()):
@@ -383,6 +431,7 @@ def car_records(db, cfg, only_hash=None):
 
 
 # ------------------------------------------------------------------ http layer
+
 def respond(code, obj, extra=None):
     body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
     headers = [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
@@ -407,7 +456,7 @@ def serve_file(path, content_type):
 def client_ip(environ, cfg):
     if cfg["trust_proxy_header"]:
         fwd = environ.get("HTTP_X_FORWARDED_FOR", "")
-        if fwd:        # the LAST address is the one your own proxy added; earlier ones are client-controlled
+        if fwd:  # the LAST address is the one your own proxy added; earlier ones are client-controlled
             return fwd.split(",")[-1].strip()[:64]
     return environ.get("REMOTE_ADDR", "?")[:64]
 
@@ -462,6 +511,26 @@ def public_config(cfg, db):
             "class_table_version": table["version"] if table else None}
 
 
+def conditions_doc(cfg):
+    """Everything a client needs to run a benchmark that the server will accept. `version` changes whenever
+    any of it changes, so a client can cache the document and revalidate cheaply (ETag / If-None-Match)."""
+    doc = {"format": 1, "profile": cfg["profile"], "tracks": cfg["tracks"], "laps": cfg["laps"],
+           "timed_laps": cfg["laps"] - 1, "max_batch": cfg["max_batch"], "max_entries": cfg["max_entries"],
+           "conditions": cfg.get("conditions") or {}, "env": cfg["env"], "accepting_submissions": bool(cfg["env"])}
+    doc["version"] = sha(json.dumps(doc, sort_keys=True, separators=(",", ":")))[:16]
+    return doc
+
+
+def handle_conditions(cfg, environ):
+    doc = conditions_doc(cfg)
+    etag = '"c-%s"' % doc["version"]
+    if environ.get("HTTP_IF_NONE_MATCH") == etag:
+        return 304, b"", [("ETag", etag)]
+    body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+    return 200, body, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
+                       ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", "no-cache")]
+
+
 def handle_register(db, cfg, environ):
     data = read_json(environ, cfg)
     rate_limit(db, "ip:" + client_ip(environ, cfg), "register", cfg["rate_register_per_hour"])
@@ -512,6 +581,9 @@ def handle_submit(db, cfg, environ):
             "laps_json=excluded.laps_json, batch=excluded.batch, env_id=excluded.env_id, created=excluded.created",
             (user["id"], norm["car_hash"], norm["car_id"], norm["name"], norm["track"], norm["score_ms"],
              norm["spread_pct"], json.dumps(norm["laps"]), norm["batch"], norm["env_id"], now()))
+        db.execute("INSERT INTO cars(car_hash, car_id, name, updated) VALUES(?,?,?,?) ON CONFLICT(car_hash) DO UPDATE SET "
+                   "car_id=excluded.car_id, name=excluded.name, updated=excluded.updated",
+                   (norm["car_hash"], norm["car_id"], norm["name"], now()))
         touched.add((norm["car_hash"], norm["track"]))
         accepted += 1
     for h, t in touched:
@@ -528,23 +600,40 @@ def handle_submit(db, cfg, environ):
                          "merged_status": status})
 
 
-_export_cache = {}
+_export = {"etag": None, "body": None, "dv": None, "table": None, "built": 0.0}
+_export_lock = threading.Lock()
+
+
+def _export_fresh(tv, dv, ttl):
+    c = _export
+    return c["body"] is not None and c["table"] == tv and (c["dv"] == dv or time.time() - c["built"] < ttl)
 
 
 def handle_classes(db, cfg, environ):
     table = latest_table(db)
-    etag = '"%s-%d"' % (table["version"] if table else 0, data_version(db))
+    tv, dv, ttl = (table["version"] if table else 0), data_version(db), max(0, int(cfg.get("export_max_age", 0)))
+    if not _export_fresh(tv, dv, ttl):
+        with _export_lock:  # one thread rebuilds, the others wait for it instead of all doing the same work
+            if not _export_fresh(tv, dv, ttl):
+                _, cars = car_records(db, cfg)
+                payload = json.dumps({"format": 1, "profile": cfg["profile"], "tracks": cfg["tracks"],
+                                      "table": table, "cars": cars}, separators=(",", ":"))
+                # the etag covers the content only (not the timestamp), so it is the same on every worker
+                body = (payload[:-1] + ',"generated":%d}' % now()).encode("utf-8")
+                _export.update(etag='"%d-%s"' % (tv, sha(payload)[:16]), body=body, dv=dv, table=tv, built=time.time())
+    etag, body = _export["etag"], _export["body"]
+    cache = "public, max-age=%d" % ttl if ttl else "no-cache"
     if environ.get("HTTP_IF_NONE_MATCH") == etag:
-        return 304, b"", [("ETag", etag)]
-    body = _export_cache.get(etag)
-    if body is None:
-        _, cars = car_records(db, cfg)
-        body = json.dumps({"format": 1, "generated": now(), "profile": cfg["profile"], "tracks": cfg["tracks"],
-                           "table": table, "cars": cars}, separators=(",", ":")).encode("utf-8")
-        _export_cache.clear()
-        _export_cache[etag] = body
+        return 304, b"", [("ETag", etag), ("Cache-Control", cache)]
     return 200, body, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
-                       ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", "no-cache")]
+                       ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", cache)]
+
+
+def _admin_ctx():
+    """The server functions admin.py needs (injected so admin.py never imports this module)."""
+    return SimpleNamespace(HttpError=HttpError, respond=respond, read_json=read_json, recompute=recompute,
+                           bump=bump, publish_classes=publish_classes, set_config=set_config,
+                           latest_table=latest_table, parse_env=parse_env, apply_env=apply_env)
 
 
 def route(environ, db_path):
@@ -552,10 +641,14 @@ def route(environ, db_path):
     try:
         cfg = get_config(db)
         method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
+        if path == "/admin" or path.startswith("/admin/"):
+            return admin.handle(environ, db, cfg, _admin_ctx())
         if method == "GET" and path in ("/", "/stats"):
             return serve_file("stats.html", "text/html; charset=utf-8")
         if method == "GET" and path == "/v1/health":
             return respond(200, {"ok": True, "api": API_VERSION, "time": now()})
+        if method == "GET" and path == "/v1/conditions":
+            return handle_conditions(cfg, environ)
         if method == "GET" and path == "/v1/config":
             return respond(200, public_config(cfg, db))
         if method == "POST" and path == "/v1/register":
@@ -583,11 +676,12 @@ def create_app(db_path):
             code, body, headers = route(environ, db_path)
         except HttpError as e:
             code, body, headers = respond(e.code, {"error": e.msg})
-        except Exception as e:           # never leak internals to the client
+        except Exception as e:  # never leak internals to the client
             sys.stderr.write("internal error: %r\n" % (e,))
             code, body, headers = respond(500, {"error": "internal error"})
         start_response("%d %s" % (code, HTTPStatus(code).phrase), headers)
         return [body]
+
     return app
 
 
@@ -595,7 +689,7 @@ _app = None
 
 
 def application(environ, start_response):
-    """WSGI entry point for gunicorn / waitress:  gunicorn -w 2 server:application  (DB path: ACB_DB)."""
+    """WSGI entry point for gunicorn / waitress: gunicorn -w 2 server:application (DB path: ACB_DB)."""
     global _app
     if _app is None:
         _app = create_app(os.environ.get("ACB_DB", "acbench.db"))
@@ -603,6 +697,7 @@ def application(environ, start_response):
 
 
 # ------------------------------------------------------------------ admin CLI
+
 def cmd_serve(args):
     class Threaded(ThreadingMixIn, WSGIServer):
         daemon_threads = True
@@ -619,27 +714,65 @@ def cmd_serve(args):
         pass
 
 
-def cmd_set_env(args, db):
-    data = json.loads(Path(args.source).read_text(encoding="utf-8"))
+TRACK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,59}$")   # a track folder name (no layout, no path parts)
+
+
+def parse_env(data):
+    """Pull a canonical environment out of a track reference (as made by the desktop app's `create`), a bare
+    {"tracks": ..., "acs": ...} object, or a track_check_log.json list (latest passed check wins).
+    -> {"profile": str|None, "tracks": {track_id: sha256}, "acs": sha256}. Raises ValueError with a readable reason."""
     env = None
     if isinstance(data, list):
         for entry in reversed(data):
-            if entry.get("status") == "ok" and entry.get("env"):
+            if isinstance(entry, dict) and entry.get("status") == "ok" and entry.get("env"):
                 env = entry["env"]
                 break
     elif isinstance(data, dict):
         env = data.get("env", data)
-    if not env or not env.get("tracks") or not env.get("acs"):
-        raise SystemExit("No usable environment (tracks digests + acs) found in that file.")
-    cfg = get_config(db)
-    if env.get("profile") and env["profile"] != cfg["profile"]:
-        print("WARNING: file is for profile %r, server is set to %r" % (env["profile"], cfg["profile"]))
+    if not isinstance(env, dict) or not env.get("tracks") or not env.get("acs"):
+        raise ValueError("No usable environment (track digests + acs) found in that data.")
+    tracks, acs = env["tracks"], env["acs"]
+    if not isinstance(tracks, dict) or not 1 <= len(tracks) <= 20:
+        raise ValueError("tracks must be an object with 1-20 entries (track folder -> sha256).")
+    for t, dg in tracks.items():
+        if not isinstance(t, str) or not TRACK_ID.match(t):
+            raise ValueError("bad track folder name: %r" % (t,))
+        if not isinstance(dg, str) or not HEX64.match(dg):
+            raise ValueError("digest for %s is not a lowercase sha256 hex string" % t)
+    if not isinstance(acs, str) or not HEX64.match(acs):
+        raise ValueError("acs is not a lowercase sha256 hex string")
+    if env.get("ignore_ui"):
+        raise ValueError("this reference was made with UI files ignored; the server refuses such environments. "
+                         "Create it again from the whole track folders.")
+    profile = env.get("profile")
+    return {"profile": profile if isinstance(profile, str) else None, "tracks": dict(tracks), "acs": acs}
+
+
+def apply_env(db, cfg, env):
+    """Make `env` (from parse_env) the canonical environment. -> list of warnings."""
+    warnings = []
+    if env["profile"] and env["profile"] != cfg["profile"]:
+        warnings.append("file is for profile %r, server is set to %r" % (env["profile"], cfg["profile"]))
     cfg["env"] = {"tracks": env["tracks"], "acs": env["acs"]}
     set_config(db, cfg)
-    print("Canonical environment set:", json.dumps(cfg["env"], indent=1))
+    bump(db)
+    db.commit()
     missing = [t.partition("/")[0] for t in cfg["tracks"] if t.partition("/")[0] not in env["tracks"]]
     if missing:
-        print("WARNING: no digest for track(s):", ", ".join(missing), "(run the check on every baseline track)")
+        warnings.append("no digest for track(s): %s (create the reference with every baseline track)" % ", ".join(missing))
+    return warnings
+
+
+def cmd_set_env(args, db):
+    try:
+        env = parse_env(json.loads(Path(args.source).read_text(encoding="utf-8")))
+    except ValueError as e:
+        raise SystemExit(str(e))
+    cfg = get_config(db)
+    warnings = apply_env(db, cfg, env)
+    print("Canonical environment set:", json.dumps(cfg["env"], indent=1))
+    for w in warnings:
+        print("WARNING:", w)
 
 
 def cmd_admin(args):
@@ -656,7 +789,7 @@ def cmd_admin(args):
         db.execute("INSERT INTO invites(code_hash, role, uses_left, created) VALUES(?,?,?,?)",
                    (sha(code), args.role, args.uses, now()))
         db.commit()
-        print("invite code (shown once): %s   role=%s uses=%d" % (code, args.role, args.uses))
+        print("invite code (shown once): %s  role=%s uses=%d" % (code, args.role, args.uses))
     elif c == "create-user":
         key = "acb_" + secrets.token_urlsafe(32)
         db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (args.name, sha(key), args.role, now()))
