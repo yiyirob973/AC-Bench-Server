@@ -4,6 +4,7 @@ Self-test for the AC Bench cloud server. Starts the real server on localhost wit
 database, simulates several users with the real client code, and checks the rules end to end.
 Run it after any change:   python selftest.py          (prints PASS / FAIL per check)
 """
+import re
 import argparse, contextlib, csv, hashlib, io, json, random, sys, tempfile, threading
 from pathlib import Path
 from wsgiref.simple_server import WSGIRequestHandler, make_server
@@ -229,10 +230,13 @@ def main():
     fast = [{"car_id": "car_new", "car_hash": newh, "name": "NEW", "track": t, "laps_ms": laps(best_t[i] * 0.97),
              "batch": 1, "env": env_id} for i, t in enumerate(tracks)]
     for who in ("A", "B"):
-        api(who, "POST", "/v1/submit", {"profile": bl.PROFILE_ID, "environments": {env_id: env}, "results": fast})
+        _, resp, _ = api(who, "POST", "/v1/submit", {"profile": bl.PROFILE_ID, "environments": {env_id: env}, "results": fast})
+    mine = {c["car_id"]: c for c in resp.get("cars", [])}
+    check(set(mine) == {"car_new"} and re.fullmatch(r"\d+[A-Z]", mine["car_new"].get("class") or "") is not None,
+          "the submit response carries the server's class for the car just uploaded")
     after = {c["car_id"]: c for c in api("T", "GET", "/v1/classes")[1]["cars"]}
     check(all(after[cid]["class"] == before[cid] for cid in before), "existing cars keep their class when a new car is added")
-    check(after["car_new"]["class"] == "A" and after["car_new"]["status"] == "verified", "the faster new car lands in class A")
+    check(after["car_new"]["class"] == "1A" and after["car_new"]["status"] == "verified", "the faster new car lands in class 1A")
     _, _, hd = api("T", "GET", "/v1/classes")
     check(api("T", "GET", "/v1/classes", etag=hd["ETag"])[0] == 304, "unchanged data answers 304 (ETag)")
 

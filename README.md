@@ -269,3 +269,18 @@ For most users, start with the [AC Bench Desktop app](https://github.com/yiyirob
 current records for just those cars: `{"profile", "tracks", "table_version", "labels", "cars": [...]}`. Unknown cars are
 absent. Nothing is cached, so the answer is always current. Rate limit: `rate_lookups_per_hour` per IP (default 240,
 editable in the admin dashboard).
+
+
+## Class labels
+
+Classes are named `1A` (top class), `1B` ... `1Z`, then `2A` ... `2Z`, `3A` ... Two-letter codes such as `AA` are no
+longer used: searching for class "A" matched cars in other classes. Tags are `#Pride-1A`, `#Pride-1B`, ... and applying
+tags replaces any older `#Pride-` tag (for example `#Pride-A`). The server renames the classes of already published
+tables the same way, so no migration is needed.
+
+
+## Submit response
+
+`POST /v1/submit` answers with `accepted`, `rejected`, `merged_status` and now also `cars`: the current class record
+(class, gap, status, flags, per-track times) of every car the submission touched, plus `tracks` and `table_version`.
+The client never classifies; it shows what the server says.

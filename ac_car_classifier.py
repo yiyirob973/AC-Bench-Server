@@ -112,21 +112,24 @@ def analyze(car_dir):
 
 
 def class_label(n):
-    """1 -> A, 2 -> B, ... 26 -> Z, 27 -> AA"""
-    s = ""
-    while n > 0:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
+    """Class number -> label. Two-letter codes (AA, AB, ...) made a search for class "A" match other classes,
+    so labels are <group><letter>: 1 -> 1A (top class), 2 -> 1B, ... 26 -> 1Z, 27 -> 2A, ... 52 -> 2Z, 53 -> 3A."""
+    if n < 1:
+        return ""
+    return "%d%s" % ((n - 1) // 26 + 1, chr(65 + (n - 1) % 26))
 
 
 def class_sort_key(label):
-    """Alphabetical order that also handles AA after Z."""
-    return (len(label), label)
+    """Top class first: 1A, 1B ... 1Z, 2A ... Older letter-only labels (A, B ... AA) sort before the new ones."""
+    s = str(label).strip()
+    m = re.fullmatch(r"(\d+)([A-Za-z]+)", s)
+    if m:
+        return (1, int(m.group(1)), len(m.group(2)), m.group(2).upper())
+    return (0, 0, len(s), s)
 
 
 def norm_class(v):
-    """Class value from a CSV -> letter label. Old numeric CSVs (1, 2, 3) become A, B, C."""
+    """Class value from a CSV -> label. Old numeric CSVs (1, 2, 3) become 1A, 1B, 1C."""
     s = str(v).strip()
     return class_label(int(s)) if s.isdigit() else s.upper()
 

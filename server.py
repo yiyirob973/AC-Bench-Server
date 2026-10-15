@@ -23,6 +23,7 @@ Admin web UI
   conditions; see admin.py for the ACB_OIDC_* / ACB_ADMIN_* environment variables.
 
 Benchmark conditions (public, no key needed)
+  POST /v1/submit  -> {"accepted", "rejected", "merged_status", "cars": [class record of each car just touched], ...}
   POST /v1/cars/lookup  {"hashes": [up to 500 car physics hashes]} -> live records for only those cars (no key needed)
   GET /v1/conditions  profile, tracks, laps, batch limit, free-form "conditions" and the reference environment
                       the server will accept; has an ETag, so clients can revalidate with If-None-Match.
@@ -168,7 +169,12 @@ def data_version(db):
 
 def latest_table(db):
     row = db.execute("SELECT version, created, body FROM class_tables ORDER BY version DESC LIMIT 1").fetchone()
-    return json.loads(row["body"]) if row else None
+    if not row:
+        return None
+    body = json.loads(row["body"])
+    # tables published before the 1A..1Z, 2A.. scheme stored letter labels (A, B, ... AA): same classes, new names
+    body["labels"] = [class_label(i + 1) for i in range(len(body.get("labels", [])))]
+    return body
 
 
 def clean_text(s):
@@ -604,8 +610,13 @@ def handle_submit(db, cfg, environ):
         row = db.execute("SELECT status FROM merged WHERE car_hash=? AND track=?", (h, t)).fetchone()
         key = row["status"] if row else "none"
         status[key] = status.get(key, 0) + 1
+    # the server decides the class: answer with the current record (class, gap, status, flags) of every car just touched
+    cars = []
+    if touched:
+        table, cars = car_records(db, cfg, only_hashes={h for h, _ in touched})
     return respond(200, {"accepted": accepted, "rejected": rejected, "rejected_total": len(entries) - accepted,
-                         "merged_status": status})
+                         "merged_status": status, "cars": cars, "tracks": cfg["tracks"],
+                         "table_version": table["version"] if touched and table else None})
 
 
 _export = {"etag": None, "body": None, "dv": None, "table": None, "built": 0.0}
