@@ -422,8 +422,8 @@ def api(db, cfg, ctx, sess, environ, method, path, now):
             raise ctx.HttpError(400, str(e))
         if role not in ("user", "trusted"):
             raise ctx.HttpError(400, "role must be user or trusted")
-        code = secrets.token_urlsafe(9)
-        db.execute("INSERT INTO invites(code_hash, role, uses_left, created) VALUES(?,?,?,?)", (_sha(code), role, uses, now))
+        code = ctx.new_invite_code()
+        db.execute("INSERT INTO invites(code_hash, role, uses_left, created) VALUES(?,?,?,?)", (ctx.invite_hash(code), role, uses, now))
         db.commit()
         _audit(db, actor, "invite_create", "role=%s uses=%d" % (role, uses))
         return ctx.respond(201, {"code": code, "role": role, "uses": uses})

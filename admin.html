@@ -104,7 +104,9 @@ function invitesView(invites) {
   const create = btn("Create invite", async () => {
     try {
       const j = await api("invites", { role: role.value, uses: Number(uses.value) });
-      toast("Invite code (shown once): ", h("code", {}, j.code));
+      const codeEl = h("code", { style: "user-select:all;font-size:1.15em;letter-spacing:.04em" }, j.code);
+      const copy = btn("Copy", async () => { try { await navigator.clipboard.writeText(j.code); toast("Copied. Invite code (shown once): ", codeEl); } catch (e) { toast("Select the code and copy it manually: ", codeEl); } });
+      toast("Invite code (shown once): ", h("span", {}, codeEl, " ", copy));
       await load(true);
     } catch (e) { toast("Error: " + e.message); }
   });

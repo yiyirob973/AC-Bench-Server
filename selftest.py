@@ -116,7 +116,7 @@ def main():
         client(who)
         check("Registered as" in run(C.cmd_register, invite=code, name="user_" + who), "invite registers user " + who)
     client("X")
-    check("invalid or used-up" in run(C.cmd_register, invite=code, name="user_X"), "a used-up invite is refused")
+    check("used up" in run(C.cmd_register, invite=code, name="user_X"), "a used-up invite is refused")
     client("T")
     check("role trusted" in run(C.cmd_register, invite=tcode, name="modder_T"), "trusted invite creates a trusted user")
 

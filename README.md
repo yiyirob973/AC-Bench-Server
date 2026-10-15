@@ -284,3 +284,10 @@ tables the same way, so no migration is needed.
 `POST /v1/submit` answers with `accepted`, `rejected`, `merged_status` and now also `cars`: the current class record
 (class, gap, status, flags, per-track times) of every car the submission touched, plus `tracks` and `table_version`.
 The client never classifies; it shows what the server says.
+
+## Invite codes
+
+Codes look like `54TE-7JWY-TSXD-8T9K` (16 characters, no look-alikes such as 0/O or 1/I/L, no `_`). Registration accepts
+them as pasted or typed: lowercase, without the hyphens, with surrounding spaces/newlines/quotes. Codes made by older
+versions still work exactly as they were issued. The error says whether the code is unknown (incomplete copy, or a
+different server than the one that issued it) or has been used up or revoked.

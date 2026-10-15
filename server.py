@@ -545,21 +545,52 @@ def handle_conditions(cfg, environ):
                        ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", "no-cache")]
 
 
+INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no I, L, O, 0, 1: nothing to mistake when read or typed
+
+
+def new_invite_code():
+    """16 characters shown as XXXX-XXXX-XXXX-XXXX. No '-' inside a group and no '_': a double-click selects a whole
+    group, and the code can be typed in lowercase, with or without the hyphens."""
+    raw = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(16))
+    return "-".join(raw[i:i + 4] for i in range(0, 16, 4))
+
+
+def invite_hash(code):
+    """What is stored for an invite: the hash of its normalised form (no hyphens or spaces, upper case)."""
+    return sha(re.sub(r"[-\s]", "", code).upper())
+
+
+def find_invite(db, text):
+    """Look an invite up from whatever the person pasted or typed. Tolerates surrounding spaces/newlines/quotes,
+    zero-width characters from copying, lowercase and missing hyphens; invites made by older versions (random
+    mixed-case codes containing - and _) are still found by their exact text. -> (code_hash, row) or (None, None)."""
+    compact = re.sub(r"[\s\u200b-\u200d\u2060\ufeff]+", "", text or "").strip("\"'`<>")
+    for cand in dict.fromkeys([text.strip(), compact, re.sub(r"[-\s]", "", compact).upper()]):
+        h = sha(cand)
+        row = db.execute("SELECT role, uses_left FROM invites WHERE code_hash=?", (h,)).fetchone()
+        if row:
+            return h, row
+    return None, None
+
+
 def handle_register(db, cfg, environ):
     data = read_json(environ, cfg)
     rate_limit(db, "ip:" + client_ip(environ, cfg), "register", cfg["rate_register_per_hour"])
     invite, name = data.get("invite"), data.get("name")
     if not isinstance(invite, str) or not isinstance(name, str) or not USER_NAME.match(name):
         raise HttpError(400, "invite and a name of 3-40 letters, digits, . _ - are required")
-    row = db.execute("SELECT role, uses_left FROM invites WHERE code_hash=?", (sha(invite.strip()),)).fetchone()
-    if not row or row["uses_left"] <= 0:
-        raise HttpError(403, "invalid or used-up invite code")
+    code_hash, row = find_invite(db, invite)
+    if not row:
+        raise HttpError(403, "unknown invite code: check that it was copied completely and that this is the same "
+                             "server the invite was created on")
+    if row["uses_left"] <= 0:
+        raise HttpError(403, "this invite code has been used up or revoked")
     key = "acb_" + secrets.token_urlsafe(32)
     try:
         db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (name, sha(key), row["role"], now()))
     except sqlite3.IntegrityError:
         raise HttpError(409, "that name is taken")
-    db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=?", (sha(invite.strip()),))
+    db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=?", (code_hash,))
     db.commit()
     return respond(201, {"api_key": key, "name": name, "role": row["role"]})
 
@@ -671,7 +702,8 @@ def _admin_ctx():
     """The server functions admin.py needs (injected so admin.py never imports this module)."""
     return SimpleNamespace(HttpError=HttpError, respond=respond, read_json=read_json, recompute=recompute,
                            bump=bump, publish_classes=publish_classes, set_config=set_config,
-                           latest_table=latest_table, parse_env=parse_env, apply_env=apply_env)
+                           latest_table=latest_table, parse_env=parse_env, apply_env=apply_env,
+                           new_invite_code=new_invite_code, invite_hash=invite_hash)
 
 
 def route(environ, db_path):
@@ -825,9 +857,9 @@ def cmd_admin(args):
     elif c == "set-env":
         cmd_set_env(args, db)
     elif c == "invite":
-        code = secrets.token_urlsafe(9)
+        code = new_invite_code()
         db.execute("INSERT INTO invites(code_hash, role, uses_left, created) VALUES(?,?,?,?)",
-                   (sha(code), args.role, args.uses, now()))
+                   (invite_hash(code), args.role, args.uses, now()))
         db.commit()
         print("invite code (shown once): %s  role=%s uses=%d" % (code, args.role, args.uses))
     elif c == "create-user":
