@@ -1,0 +1,225 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AC Bench admin</title>
+<style nonce="{{NONCE}}">
+:root{color-scheme:dark;--bg:#14171c;--card:#1d2129;--line:#2c323d;--fg:#e6e8eb;--mut:#8b93a1;--acc:#7fb2ff;--bad:#ff7b72;--ok:#56d364;--warn:#e3b341}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;gap:1rem;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;border-bottom:1px solid var(--line)}
+h1{font-size:1.05rem;margin:0}h2{font-size:.95rem;margin:0 0 .6rem;color:var(--acc)}
+main{max-width:1100px;margin:0 auto;padding:1rem;display:grid;gap:1rem}
+section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem;overflow-x:auto}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--mut);font-weight:500}
+button,input,select,textarea{font:inherit;color:var(--fg);background:#262b35;border:1px solid var(--line);border-radius:6px;padding:.3rem .6rem}
+button{cursor:pointer}button:hover{border-color:var(--acc)}button.danger:hover{border-color:var(--bad)}
+.stats{display:flex;flex-wrap:wrap;gap:.6rem}.stat{background:#262b35;border-radius:6px;padding:.5rem .8rem;min-width:7rem}
+.stat b{display:block;font-size:1.3rem}.stat span,.mut{color:var(--mut)}
+.row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:.6rem}
+.tag{padding:.05rem .4rem;border-radius:4px;background:#262b35}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+#toast{position:fixed;right:1rem;bottom:1rem;max-width:24rem;background:#262b35;border:1px solid var(--line);border-radius:8px;padding:.7rem 1rem;display:none}
+#toast.show{display:block}code{user-select:all;color:var(--ok)}.wide{width:100%;font-family:ui-monospace,monospace}.w5{width:5rem}.w7{width:7rem}
+</style>
+</head>
+<body>
+<header><h1>AC Bench admin</h1><div class="row"><span class="mut" id="me"></span><button id="logout">Sign out</button></div></header>
+<main id="main"><section>Loading…</section></main>
+<div id="toast"></div>
+<script nonce="{{NONCE}}">
+"use strict";
+let CSRF = "";
+const h = (tag, props, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v);
+  }
+  for (const c of kids.flat()) if (c !== null && c !== undefined && c !== false) e.append(c instanceof Node ? c : document.createTextNode(String(c)));
+  return e;
+};
+const when = ts => new Date(ts * 1000).toLocaleString();
+const lap = ms => { const m = Math.floor(ms / 60000), s = (ms % 60000) / 1000; return m + ":" + s.toFixed(3).padStart(6, "0"); };
+let toastTimer;
+function toast(msg, node) {
+  const t = document.getElementById("toast");
+  t.replaceChildren(msg, node || "");
+  t.className = "show";
+  t.onclick = () => { t.className = ""; };
+  clearTimeout(toastTimer);
+  if (!node) toastTimer = setTimeout(() => t.className = "", 5000);
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF }, body: JSON.stringify(body) };
+  const r = await fetch("/admin/api/" + path, opt);
+  if (r.status === 401) { location.href = "/admin/login"; throw new Error("signed out"); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || ("HTTP " + r.status));
+  return j;
+}
+async function act(path, body, ok, confirmMsg) {
+  if (confirmMsg && !confirm(confirmMsg)) return;
+  try { const j = await api(path, body); toast(ok ? ok(j) : "Done"); await load(); }
+  catch (e) { toast("Error: " + e.message); }
+}
+const btn = (label, fn, cls) => h("button", { class: cls || "", onclick: fn }, label);
+
+function statsView(s) {
+  return h("section", {}, h("h2", {}, "Overview"), h("div", { class: "stats" },
+    Object.entries(s).map(([k, v]) => h("div", { class: "stat" }, h("b", {}, v), h("span", {}, k.replace("_", " ")))))); 
+}
+const usersState = { q: "", offset: 0, limit: 50 };
+function usersView() {
+  const body = h("div", {});
+  const search = h("input", { placeholder: "Search by name", value: usersState.q });
+  async function refresh() {
+    const j = await api("users?q=" + encodeURIComponent(usersState.q) + "&limit=" + usersState.limit + "&offset=" + usersState.offset);
+    const rows = j.users.map(u => h("tr", {},
+      h("td", {}, u.name), h("td", {}, h("span", { class: "tag" }, u.role)),
+      h("td", { class: u.banned ? "bad" : "ok" }, u.banned ? "banned" : "active"),
+      h("td", {}, u.submissions), h("td", { class: "mut" }, when(u.created)),
+      h("td", {}, h("div", { class: "row" },
+        u.banned ? btn("Unban", () => act("users/" + u.id + "/unban", {}, r => "Unbanned, " + r.recomputed + " entries recomputed"))
+                 : btn("Ban", () => act("users/" + u.id + "/ban", {}, r => "Banned, " + r.recomputed + " entries recomputed"), "danger"),
+        btn(u.role === "trusted" ? "Make user" : "Make trusted",
+            () => act("users/" + u.id + "/role", { role: u.role === "trusted" ? "user" : "trusted" }, r => "Role changed, " + r.recomputed + " entries recomputed"))))));
+    const first = j.total ? j.offset + 1 : 0, last = j.offset + j.users.length;
+    const go = off => { usersState.offset = Math.max(0, off); refresh().catch(e => toast("Error: " + e.message)); };
+    body.replaceChildren(
+      h("table", {}, h("tr", {}, ["Name", "Role", "Status", "Submissions", "Created", ""].map(x => h("th", {}, x))), rows),
+      h("div", { class: "row" }, h("span", { class: "mut" }, first + "–" + last + " of " + j.total),
+        j.offset > 0 ? btn("Previous", () => go(j.offset - j.limit)) : "",
+        last < j.total ? btn("Next", () => go(j.offset + j.limit)) : ""));
+  }
+  const run = () => { usersState.q = search.value.trim(); usersState.offset = 0; refresh().catch(e => toast("Error: " + e.message)); };
+  search.addEventListener("keydown", e => { if (e.key === "Enter") run(); });
+  refresh().catch(e => toast("Error: " + e.message));
+  return h("section", {}, h("h2", {}, "Users"), h("div", { class: "row" }, search, btn("Search", run)), body);
+}
+function invitesView(invites) {
+  const role = h("select", {}, h("option", {}, "user"), h("option", {}, "trusted"));
+  const uses = h("input", { type: "number", min: "1", max: "1000", value: "1", class: "w5" });
+  const create = btn("Create invite", async () => {
+    try {
+      const j = await api("invites", { role: role.value, uses: Number(uses.value) });
+      toast("Invite code (shown once): ", h("code", {}, j.code));
+      await load(true);
+    } catch (e) { toast("Error: " + e.message); }
+  });
+  return h("section", {}, h("h2", {}, "Invites"), h("div", { class: "row" }, role, h("span", { class: "mut" }, "uses"), uses, create),
+    h("table", {}, h("tr", {}, ["Id", "Role", "Uses left", "Created", ""].map(x => h("th", {}, x))),
+      invites.map(i => h("tr", {}, h("td", { class: "mut" }, i.id.slice(0, 10)), h("td", {}, i.role), h("td", {}, i.uses_left),
+        h("td", { class: "mut" }, when(i.created)),
+        h("td", {}, i.uses_left > 0 ? btn("Revoke", () => act("invites/revoke", { id: i.id }, null, "Revoke this invite?"), "danger") : "")))));
+}
+function disputedView(list) {
+  const rows = list.map(d => {
+    const chips = d.submissions.map(s => h("span", { class: "tag" },
+      s.user + " " + lap(s.score_ms) + " ",
+      btn("remove", () => act("submissions/" + s.id + "/delete", {}, null,
+        "Delete " + s.user + "'s submission for " + s.car_id + "?"), "danger")));
+    const car = d.submissions[0] ? d.submissions[0].car_id : d.car_hash.slice(0, 12);
+    return h("tr", {}, h("td", {}, car), h("td", {}, d.track.split("/")[0]),
+      h("td", {}, h("div", { class: "row" }, chips)));
+  });
+  return h("section", {}, h("h2", {}, "Disputed results (" + list.length + ")"),
+    list.length ? h("table", {}, h("tr", {}, ["Car", "Track", "Submissions"].map(x => h("th", {}, x))), rows)
+                : h("span", { class: "mut" }, "None."));
+}
+function classesView(d) {
+  const prov = h("input", { type: "checkbox" });
+  return h("section", {}, h("h2", {}, "Class tables"), h("div", { class: "row" },
+    btn("Publish new class table", () => act("publish", { include_provisional: prov.checked }, j => "Published v" + j.version + ": " + j.n_cars + " cars, " + j.classes + " classes",
+      "Publish a new class table? Cars may change class for all clients."), ""),
+    h("label", {}, prov, " include provisional"), btn("Recompute all merges", () => act("recompute", {}, j => "Recomputed " + j.recomputed + " entries", "Recompute every merged result?"))),
+    h("table", {}, h("tr", {}, ["Version", "Created", "Cars", "Classes", "Provisional"].map(x => h("th", {}, x))),
+      d.class_tables.map(t => h("tr", {}, h("td", {}, "v" + t.version), h("td", { class: "mut" }, when(t.created)), h("td", {}, t.n_cars), h("td", {}, t.classes), h("td", {}, t.include_provisional ? "yes" : "no")))));
+}
+function benchmarkView(b) {
+  const profile = h("input", { value: b.profile });
+  const tracks = h("textarea", { class: "wide", rows: "4" });
+  tracks.value = b.tracks.join("\n");
+  const laps = h("input", { type: "number", min: "2", max: "12", value: b.laps, class: "w5" });
+  const batch = h("input", { type: "number", min: "1", max: "64", value: b.max_batch, class: "w5" });
+  const cond = h("textarea", { class: "wide", rows: "8" });
+  cond.value = JSON.stringify(b.conditions, null, 2);
+  const save = btn("Save conditions", async () => {
+    let conditions;
+    try { conditions = JSON.parse(cond.value.trim() || "{}"); }
+    catch (e) { toast("Conditions is not valid JSON: " + e.message); return; }
+    if (!confirm("Save these benchmark conditions? Clients are told about them immediately, and uploads made under different conditions are rejected.")) return;
+    try {
+      const j = await api("conditions", { profile: profile.value.trim(), tracks: tracks.value.split("\n").map(x => x.trim()).filter(Boolean),
+        laps: Number(laps.value), max_batch: Number(batch.value), conditions });
+      toast(j.changed.length ? "Saved (" + j.changed.join(", ") + "). " : "Nothing changed. ", j.warnings.length ? h("div", { class: "warn" }, j.warnings.join(" ")) : "");
+      await load();
+    } catch (e) { toast("Error: " + e.message); }
+  });
+  return h("section", {}, h("h2", {}, "Benchmark conditions"),
+    h("p", { class: "mut" }, "Served to desktop clients at /v1/conditions. Uploads are checked against these."),
+    h("div", { class: "row" }, h("label", {}, "Profile ", profile), h("label", {}, "Laps recorded ", laps), h("label", {}, "Max batch ", batch)),
+    h("p", { class: "mut" }, "Tracks, one per line (track or track/layout)"), tracks,
+    h("p", { class: "mut" }, "Other conditions (free-form JSON object, e.g. weather, time of day, tyres)"), cond,
+    h("div", { class: "row" }, save));
+}
+function envView(e) {
+  const box = h("textarea", { class: "wide", rows: "6", placeholder: "…or paste the contents of track_reference.json here" });
+  const file = h("input", { type: "file", accept: ".json,application/json" });
+  file.addEventListener("change", async () => {
+    const f = file.files[0];
+    if (!f) return;
+    if (f.size > 1000000) { toast("That file is too large to be a track reference."); file.value = ""; return; }
+    box.value = await f.text();
+  });
+  const missing = e.set ? e.wanted.filter(t => !(t in e.tracks)) : e.wanted;
+  const upload = btn("Set canonical environment", async () => {
+    let reference;
+    try { reference = JSON.parse(box.value.trim()); }
+    catch (err) { toast("Not valid JSON: " + (box.value.trim() ? err.message : "choose a file or paste its contents first")); return; }
+    if (!confirm((e.set ? "REPLACE the canonical environment? Clients whose installs do not match the new reference will have uploads rejected."
+                        : "Set the canonical environment? The server starts accepting submissions that match it.") )) return;
+    try {
+      const j = await api("env", { reference });
+      toast("Environment set for " + j.tracks.join(", ") + (j.changed.length ? " (changed: " + j.changed.join(", ") + ")" : " (no digest changed)") + ". ",
+            j.warnings.length ? h("div", { class: "warn" }, j.warnings.join(" ")) : "");
+      await load();
+    } catch (err) { toast("Error: " + err.message); }
+  });
+  return h("section", {}, h("h2", {}, "Canonical environment (track reference)"),
+    h("p", { class: e.set ? "mut" : "warn" }, e.set ? "Set. acs.exe " + (e.acs || "").slice(0, 12) : "NOT SET: submissions are refused until a reference is loaded."),
+    e.set ? h("table", {}, h("tr", {}, ["Track", "Digest"].map(x => h("th", {}, x))),
+      Object.entries(e.tracks).map(([t, dg]) => h("tr", {}, h("td", {}, t), h("td", { class: "mut" }, dg.slice(0, 12))))) : "",
+    missing.length ? h("p", { class: "warn" }, "No digest yet for benchmark track(s): " + missing.join(", ")) : "",
+    h("p", { class: "mut" }, "Make the reference from a clean install with the desktop app (Vanilla check > Create track reference), then upload the file here. Same as the set-env command."),
+    h("div", { class: "row" }, file), box, h("div", { class: "row" }, upload));
+}
+function configView(d) {
+  return h("section", {}, h("h2", {}, "Settings"),
+    h("p", { class: "mut" }, "Canonical environment " + (d.env.set ? "set (" + Object.keys(d.env.tracks).join(", ") + ")" : "NOT SET (see the Canonical environment section)")),
+    h("table", {}, h("tr", {}, ["Key", "Value", ""].map(x => h("th", {}, x))),
+      Object.entries(d.config).map(([k, v]) => { const i = h("input", { value: v, class: "w7" });
+        return h("tr", {}, h("td", {}, k), h("td", {}, i), h("td", {}, btn("Save", () => act("config", { key: k, value: Number(i.value) },
+          () => "Saved " + k + ". Run “Recompute all merges” if this affects agreement."))));})));
+}
+function auditView(a) {
+  return h("section", {}, h("h2", {}, "Audit log"), h("table", {}, a.map(e => h("tr", {}, h("td", { class: "mut" }, when(e.ts)), h("td", {}, e.actor), h("td", {}, e.action), h("td", { class: "mut" }, e.detail)))));
+}
+async function load(keepToast) {
+  const d = await api("overview");
+  CSRF = d.me.csrf;
+  document.getElementById("me").textContent = d.me.name || d.me.email || d.me.sub;
+  document.getElementById("main").replaceChildren(statsView(d.stats), benchmarkView(d.benchmark), envView(d.env), usersView(), invitesView(d.invites),
+    disputedView(d.disputed), classesView(d), configView(d), auditView(d.audit));
+}
+document.getElementById("logout").addEventListener("click", async () => {
+  try {
+    await fetch("/admin/logout", { method: "POST", headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF }, body: "{}" });
+  } catch (e) {}
+  location.href = "/admin/signed-out";
+});
+load().catch(e => toast("Error: " + e.message));
+</script>
+</body>
+</html>

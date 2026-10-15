@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AC Bench class results</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --paper: #edf0f4; --panel: #ffffff; --ink: #172033; --muted: #556176; --rule: #d2d9e4;
+  --accent: #0b6a5e; --accent-ink: #ffffff; --focus: #1858c8; --warn: #8a4b00;
+  --chip-s: 60%; --chip-bg: 90%; --chip-fg: 24%; --tick-l: 40%; --band-a: .10;
+  --font: Bahnschrift, "DIN Alternate", "Segoe UI Variable Text", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #11151c; --panel: #19202a; --ink: #e6ebf3; --muted: #9ba7b9; --rule: #2c3543;
+    --accent: #38c4ae; --accent-ink: #05201b; --focus: #7aa9ff; --warn: #f0b259;
+    --chip-s: 52%; --chip-bg: 25%; --chip-fg: 85%; --tick-l: 62%; --band-a: .16;
+  }
+}
+* { box-sizing: border-box; }
+html { background: var(--paper); }
+body { margin: 0; color: var(--ink); font: 15px/1.45 var(--font); font-variant-numeric: tabular-nums; }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 22px 20px 64px; }
+h1 { margin: 0; font-size: 30px; line-height: 1.1; font-weight: 700; font-stretch: 88%; letter-spacing: .1px; }
+h2 { margin: 0 0 6px; font-size: 18px; font-weight: 700; font-stretch: 92%; }
+p { margin: 0; }
+.lede { color: var(--muted); margin-top: 6px; max-width: 70ch; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 16px 18px; margin-top: 18px; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+[hidden] { display: none !important; }
+
+button, .filebtn, input, select { font: inherit; color: inherit; }
+button, .filebtn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 7px 13px; border: 1px solid var(--rule);
+  border-radius: 5px; background: var(--panel); cursor: pointer; min-height: 36px;
+}
+button:hover, .filebtn:hover { border-color: var(--muted); }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+input[type=text], input[type=search], input[type=url], select {
+  padding: 7px 10px; border: 1px solid var(--rule); border-radius: 5px; background: var(--panel); min-height: 36px;
+}
+.filebtn input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.filebtn:focus-within { outline: 3px solid var(--focus); outline-offset: 2px; }
+
+/* data source */
+#srcform { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+#srcform label.field { display: grid; gap: 4px; color: var(--muted); font-size: 13px; flex: 1 1 320px; }
+#srcmsg { margin-top: 10px; color: var(--muted); min-height: 1.4em; }
+#srcmsg.err { color: var(--warn); }
+#snapnote { color: var(--muted); }
+
+/* facts */
+.facts { display: flex; flex-wrap: wrap; gap: 6px 30px; margin: 18px 0 0; }
+.facts div { display: flex; gap: 8px; align-items: baseline; }
+.facts dt { color: var(--muted); font-size: 13px; }
+.facts dd { margin: 0; font-weight: 700; font-size: 17px; }
+
+/* spectrum */
+#strip { position: relative; margin-top: 8px; }
+#strip svg { display: block; width: 100%; height: auto; overflow: visible; }
+.tick { stroke: hsl(var(--h) 68% var(--tick-l)); stroke-width: 1.6; stroke-linecap: round; transition: opacity .15s; }
+.tick.dim { opacity: .14; }
+.band { fill: hsl(var(--h) 68% var(--tick-l) / var(--band-a)); }
+.cut { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 4; opacity: .55; }
+.axis { stroke: var(--rule); stroke-width: 1; }
+.axtext { fill: var(--muted); font-size: 11.5px; text-anchor: middle; font-family: var(--font); }
+.clabel { fill: hsl(var(--h) 68% var(--tick-l)); font-size: 15px; font-weight: 700; text-anchor: middle; cursor: pointer; font-family: var(--font); }
+.clabel:hover { text-decoration: underline; }
+.hint { color: var(--muted); font-size: 13.5px; max-width: 80ch; }
+#tip { position: absolute; pointer-events: none; background: var(--ink); color: var(--panel); padding: 5px 9px; border-radius: 4px; font-size: 13px; white-space: nowrap; transform: translate(-50%, -100%); z-index: 3; }
+#tip small { display: block; opacity: .8; }
+#chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.chip { --pad: 4px; padding: 3px 10px 3px 8px; min-height: 30px; border-radius: 15px; border-color: hsl(var(--h) var(--chip-s) 55% / .55);
+  background: hsl(var(--h) var(--chip-s) var(--chip-bg)); color: hsl(var(--h) var(--chip-s) var(--chip-fg)); font-weight: 700; }
+.chip .n { font-weight: 400; opacity: .85; font-size: 13px; }
+.chip[aria-pressed=true] { outline: 2px solid hsl(var(--h) 70% 45%); outline-offset: 1px; }
+.chip.static { cursor: default; }
+
+/* toolbar + table */
+#bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 18px; }
+#bar input[type=search] { flex: 1 1 240px; max-width: 360px; }
+#bar label.check { display: inline-flex; gap: 6px; align-items: center; }
+#count { margin-left: auto; color: var(--muted); }
+.tablewrap { margin-top: 10px; overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; }
+table { width: 100%; border-collapse: collapse; min-width: 760px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { position: sticky; top: 0; background: var(--panel); font-weight: 600; font-size: 13px; color: var(--muted); white-space: nowrap; }
+th button { border: 0; background: none; padding: 0; min-height: 0; font-weight: 600; font-size: 13px; color: inherit; gap: 4px; }
+th[aria-sort=ascending] button::after { content: "\2191"; }
+th[aria-sort=descending] button::after { content: "\2193"; }
+th[aria-sort=ascending], th[aria-sort=descending] { color: var(--ink); }
+td.num, th.num { text-align: right; }
+tr.car { cursor: pointer; }
+tr.car:hover td { background: color-mix(in srgb, var(--ink) 4%, transparent); }
+.name { font-weight: 600; }
+.sub { display: block; color: var(--muted); font-size: 12.5px; font-weight: 400; }
+.cls { display: inline-block; min-width: 28px; text-align: center; padding: 1px 8px; border-radius: 12px; font-weight: 700;
+  background: hsl(var(--h) var(--chip-s) var(--chip-bg)); color: hsl(var(--h) var(--chip-s) var(--chip-fg)); }
+.cls.none { background: none; color: var(--muted); font-weight: 400; }
+.st { white-space: nowrap; }
+.st::before { content: ""; display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; border: 2px solid var(--muted); }
+.st.verified::before { background: var(--accent); border-color: var(--accent); }
+.st.provisional::before { border-color: var(--accent); }
+.flags { color: var(--warn); font-size: 13px; }
+tr.detail td { background: color-mix(in srgb, var(--ink) 3%, transparent); }
+.dgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 8px 24px; font-size: 13.5px; }
+.dgrid b { display: block; color: var(--muted); font-weight: 600; font-size: 12.5px; }
+.hash { font-family: ui-monospace, Consolas, monospace; font-size: 12px; word-break: break-all; }
+#more { margin: 12px; }
+.empty { padding: 26px 18px; color: var(--muted); }
+
+/* publish */
+.btnrow { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); background: var(--ink); color: var(--panel);
+  padding: 9px 16px; border-radius: 5px; opacity: 0; pointer-events: none; transition: opacity .2s; max-width: 90vw; }
+#toast.on { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (max-width: 640px) { h1 { font-size: 25px; } .wrap { padding: 16px 12px 56px; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>AC Bench class results</h1>
+    <p class="lede" id="lede">Assetto Corsa cars grouped by AI lap time on fixed vanilla Kunos tracks. Class A is the fastest.</p>
+  </header>
+
+  <section class="panel" id="source" aria-label="Data source">
+    <form id="srcform">
+      <label class="field">Server address
+        <input type="url" id="srv" placeholder="https://your-server.example" autocomplete="url" spellcheck="false">
+      </label>
+      <button type="submit" class="primary">Load from server</button>
+      <label class="filebtn">Load file<input type="file" id="file" accept=".json,application/json"></label>
+    </form>
+    <p id="srcmsg" role="status"></p>
+    <p id="snapnote" hidden></p>
+  </section>
+
+  <dl class="facts" id="facts" hidden></dl>
+
+  <section class="panel" id="spectrum" hidden>
+    <h2>Class spectrum</h2>
+    <p class="hint">Every tick is one car, placed by how far it is behind the fastest (lap-time scale). Dashed lines are the class borders; empty stretches between clusters are the natural gaps. Click a class to filter the table.</p>
+    <div id="strip"></div>
+    <div id="chips"></div>
+  </section>
+
+  <div id="bar" hidden>
+    <label class="sr" for="q">Search cars</label>
+    <input type="search" id="q" placeholder="Search by car name or folder">
+    <label class="sr" for="status">Status</label>
+    <select id="status">
+      <option value="all">All cars</option>
+      <option value="verified">Verified</option>
+      <option value="provisional">Provisional</option>
+      <option value="unclassified">Not classified</option>
+    </select>
+    <label class="check"><input type="checkbox" id="flagged"> Only flagged</label>
+    <span id="count"></span>
+  </div>
+
+  <div class="tablewrap" id="tablewrap" hidden>
+    <table id="tbl"><caption class="sr">Cars with class, rating and lap times</caption><thead></thead><tbody></tbody></table>
+    <button type="button" id="more" hidden></button>
+  </div>
+
+  <section class="panel" id="publish" hidden>
+    <h2>Publish</h2>
+    <p class="hint">Exports use what the table shows now: your search, filters and sort apply to every format. A snapshot is one HTML file that contains this page and the data, so it works anywhere without a server.</p>
+    <div class="btnrow">
+      <button type="button" class="primary" id="b-snap">Save snapshot page</button>
+      <button type="button" id="b-csv">Download CSV</button>
+      <button type="button" id="b-json">Download JSON</button>
+      <button type="button" id="b-md">Copy Markdown</button>
+    </div>
+  </section>
+</div>
+<div id="tip" hidden></div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script id="embedded-data" type="application/json"></script>
+<script>
+"use strict";
+// The page's own source, taken before anything is changed, so a snapshot can be saved from it.
+const SRC = "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+const DEFAULT_SERVER = "https://bench.cauch.uk";   // change this to your server, or type another address in the page
+const PAGE = 300;
+
+const $ = (id) => document.getElementById(id);
+
+/* ------------------------------------------------------------------ small helpers */
+function el(tag, attrs, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v === null || v === undefined || v === false) continue;
+    if (k.startsWith("on")) e[k] = v; else e.setAttribute(k, v === true ? "" : String(v));
+  }
+  for (const kid of kids) if (kid !== null && kid !== undefined) e.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return e;
+}
+function svg(tag, attrs) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, String(v));
+  return e;
+}
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.classList.add("on");
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("on"), 2600);
+}
+function fmtTime(ms) {
+  if (ms === null || ms === undefined || !isFinite(ms)) return "";
+  const total = Math.round(ms);
+  const m = Math.floor(total / 60000), s = Math.floor((total % 60000) / 1000), r = total % 1000;
+  return m + ":" + String(s).padStart(2, "0") + "." + String(r).padStart(3, "0");
+}
+function fmtPct(x, signed) {
+  if (x === null || x === undefined || !isFinite(x)) return "";
+  return (signed && x >= 0 ? "+" : "") + x.toFixed(2) + "%";
+}
+function trackParts(spec) { const i = spec.indexOf("/"); return i < 0 ? [spec, ""] : [spec.slice(0, i), spec.slice(i + 1)]; }
+function classHue(i, count) { return Math.round(258 - (count > 1 ? i / (count - 1) : 0) * 238); }   // violet (fast) to orange (slow)
+function csvCell(v, text) {
+  let s = v === null || v === undefined ? "" : String(v);
+  if (text && /^[=+\-@\t\r]/.test(s)) s = "'" + s;          // keep spreadsheets from running a car name as a formula
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function mdCell(s) { return String(s).replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/[\r\n]+/g, " "); }
+function stamp(sec) { return sec ? new Date(sec * 1000).toLocaleString() : ""; }
+
+/* ------------------------------------------------------------------ data */
+const state = {
+  data: null, table: null, tracks: [], labels: [], rows: [], snapshot: false, source: "",
+  f: { q: "", status: "all", flagged: false, classes: new Set() },
+  sort: { key: "score", dir: 1 }, shown: PAGE, open: new Set(), view: [],
+};
+
+function normalise(data) {
+  if (!data || typeof data !== "object" || !Array.isArray(data.cars) || !Array.isArray(data.tracks))
+    throw new Error("This is not an AC Bench class file (no cars or tracks).");
+  const tracks = data.tracks.map(String);
+  const table = data.table && typeof data.table === "object" ? data.table : null;
+  const labels = table && Array.isArray(table.labels) ? table.labels.map(String) : [];
+  const num = (x) => (typeof x === "number" && isFinite(x) ? x : null);
+  const rows = data.cars.map((c) => {
+    const times = {}, deltas = {}, n = {};
+    for (const t of tracks) {
+      times[t] = num((c.times_ms || {})[t]); deltas[t] = num((c.deltas || {})[t]); n[t] = num((c.n || {})[t]);
+    }
+    return {
+      raw: c, hash: String(c.car_hash || ""), id: String(c.car_id || ""), name: String(c.name || c.car_id || "(unnamed)"),
+      status: String(c.status || ""), cls: c.class ? String(c.class) : null, score: num(c.score_pct), gap: num(c.gap_pct),
+      times, deltas, n, variance: num(c.variance_pct), flags: Array.isArray(c.flags) ? c.flags.map(String) : [],
+      bop: String(c.bop || ""), updated: num(c.updated),
+    };
+  });
+  return { tracks, table, labels, rows };
+}
+
+function setData(data, meta) {
+  const nd = normalise(data);
+  Object.assign(state, { data, table: nd.table, tracks: nd.tracks, labels: nd.labels, rows: nd.rows,
+                         snapshot: !!meta.snapshot, source: meta.source || "" });
+  state.f.classes.clear(); state.shown = PAGE; state.open.clear();
+  for (const id of ["facts", "spectrum", "bar", "tablewrap", "publish"]) $(id).hidden = false;
+  renderFacts(); renderHead(); renderAll();
+}
+
+/* ------------------------------------------------------------------ filtering and sorting */
+function clsIndex(label) { const i = state.labels.indexOf(label); return i < 0 ? 1e9 : i; }
+function sortValue(r, key) {
+  switch (key) {
+    case "cls": return r.cls ? clsIndex(r.cls) : null;
+    case "name": return r.name.toLowerCase();
+    case "status": return r.status;
+    case "score": return r.score;
+    case "gap": return r.gap;
+    case "flags": return r.flags.length;
+    default: return key.startsWith("t:") ? r.times[key.slice(2)] : null;
+  }
+}
+function computeView() {
+  const f = state.f, q = f.q.trim().toLowerCase();
+  let rows = state.rows.filter((r) => {
+    if (q && !(r.name.toLowerCase().includes(q) || r.id.toLowerCase().includes(q))) return false;
+    if (f.status === "verified" && r.status !== "verified") return false;
+    if (f.status === "provisional" && r.status !== "provisional") return false;
+    if (f.status === "unclassified" && r.cls) return false;
+    if (f.flagged && !r.flags.length) return false;
+    if (f.classes.size && !f.classes.has(r.cls)) return false;
+    return true;
+  });
+  const { key, dir } = state.sort;
+  const have = rows.filter((r) => sortValue(r, key) !== null && sortValue(r, key) !== "");
+  const none = rows.filter((r) => sortValue(r, key) === null || sortValue(r, key) === "");
+  have.sort((a, b) => {
+    const x = sortValue(a, key), y = sortValue(b, key);
+    return (x < y ? -1 : x > y ? 1 : a.name.localeCompare(b.name)) * dir;
+  });
+  state.view = have.concat(none);
+}
+
+/* ------------------------------------------------------------------ rendering */
+function renderFacts() {
+  const rows = state.rows, f = $("facts"); f.replaceChildren();
+  const count = (fn) => rows.filter(fn).length;
+  const items = [
+    ["Class table", state.table ? "v" + state.table.version : "none yet"],
+    ["Cars", rows.length], ["Classified", count((r) => r.cls)],
+    ["Verified", count((r) => r.status === "verified")], ["Provisional", count((r) => r.status === "provisional")],
+  ];
+  for (const [k, v] of items) f.append(el("div", {}, el("dt", {}, k), el("dd", {}, v)));
+}
+function renderHead() {
+  const note = $("snapnote");
+  const when = stamp(state.data.generated);
+  $("source").hidden = false;
+  if (state.snapshot) {
+    $("srcform").hidden = true; $("srcmsg").hidden = true; note.hidden = false;
+    note.textContent = "Snapshot of the class data" + (when ? " from " + when : "") + ". It does not update by itself.";
+  } else {
+    note.hidden = true;
+    setMsg("Loaded " + state.rows.length + " cars" + (state.source ? " from " + state.source : "") + (when ? ", generated " + when : "") + ".");
+  }
+  if (!state.table) setMsg("The server has no class table yet, so no car has a class. Publish classes on the server first.", true);
+}
+function setMsg(text, err) { const m = $("srcmsg"); m.hidden = false; m.textContent = text; m.classList.toggle("err", !!err); }
+
+function renderAll() { computeView(); renderChips(); renderStrip(); renderTable(); }
+
+function renderChips() {
+  const box = $("chips"); box.replaceChildren();
+  if (!state.table) return;
+  const counts = {};
+  for (const r of state.rows) if (r.cls) counts[r.cls] = (counts[r.cls] || 0) + 1;
+  state.labels.forEach((lab, i) => {
+    const b = el("button", { type: "button", class: "chip", "aria-pressed": state.f.classes.has(lab),
+                             title: "Show only class " + lab, onclick: () => toggleClass(lab) }, lab, el("span", { class: "n" }, counts[lab] || 0));
+    b.style.setProperty("--h", classHue(i, state.labels.length));
+    box.append(b);
+  });
+  if (state.f.classes.size) box.append(el("button", { type: "button", onclick: () => { state.f.classes.clear(); state.shown = PAGE; renderAll(); } }, "Show all classes"));
+}
+function toggleClass(lab) {
+  const s = state.f.classes; if (s.has(lab)) s.delete(lab); else s.add(lab);
+  state.shown = PAGE; renderAll();
+}
+
+function renderStrip() {
+  const host = $("strip"); host.replaceChildren(); $("tip").hidden = true;
+  const cars = state.rows.filter((r) => r.cls && r.score !== null).sort((a, b) => a.score - b.score);
+  if (!cars.length) { host.append(el("p", { class: "empty" }, "No classified cars to draw yet.")); return; }
+  const W = Math.max(320, host.clientWidth || 900), H = 150, padL = 16, padR = 16, labelY = 20, tTop = 36, tBot = 98, axisY = 114;
+  const ys = cars.map((r) => Math.log1p(r.score / 100));
+  const y0 = ys[0], y1 = ys[ys.length - 1], span = Math.max(y1 - y0, 1e-6);
+  const X = (score) => padL + (Math.log1p(score / 100) - y0) / span * (W - padL - padR);
+  const s = svg("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": "Cars placed by rating, grouped into classes" });
+  const filtering = state.f.classes.size > 0;
+  const byClass = new Map();
+  for (const r of cars) { const x = X(r.score); if (!byClass.has(r.cls)) byClass.set(r.cls, []); byClass.get(r.cls).push(x); }
+
+  state.labels.forEach((lab, i) => {                       // occupied range of each class
+    const xs = byClass.get(lab); if (!xs) return;
+    const hue = classHue(i, state.labels.length);
+    const band = svg("rect", { class: "band", x: xs[0] - 4, y: tTop - 6, width: xs[xs.length - 1] - xs[0] + 8, height: tBot - tTop + 12, rx: 3 });
+    band.style.setProperty("--h", hue); s.append(band);
+  });
+  for (const c of (state.table && state.table.cuts) || []) {   // class borders
+    if (!(c > cars[0].score && c < cars[cars.length - 1].score)) continue;
+    const x = X(c); s.append(svg("line", { class: "cut", x1: x, x2: x, y1: labelY + 6, y2: axisY }));
+  }
+  s.append(svg("line", { class: "axis", x1: padL, x2: W - padR, y1: axisY, y2: axisY }));
+  let lastX = -1e9;                                          // axis marks, spaced so they never overlap
+  for (const v of [0, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 40, 60, 80, 100, 150, 200]) {
+    if (v < cars[0].score - 1e-9 || v > cars[cars.length - 1].score + 1e-9) continue;
+    const x = X(v); if (x - lastX < 54) continue; lastX = x;
+    s.append(svg("line", { class: "axis", x1: x, x2: x, y1: axisY, y2: axisY + 5 }));
+    const t = svg("text", { class: "axtext", x, y: axisY + 19 }); t.textContent = v + "%"; s.append(t);
+  }
+  for (const r of cars) {
+    const x = X(r.score), i = clsIndex(r.cls);
+    const ln = svg("line", { class: "tick" + (filtering && !state.f.classes.has(r.cls) ? " dim" : ""), x1: x, x2: x, y1: tTop, y2: tBot });
+    ln.style.setProperty("--h", classHue(i, state.labels.length)); s.append(ln);
+  }
+  let lastRight = -1e9;                                      // class labels, left to right, skipping those that would collide
+  state.labels.forEach((lab, i) => {
+    const xs = byClass.get(lab); if (!xs) return;
+    const cx = (xs[0] + xs[xs.length - 1]) / 2, w = 12 + 9 * lab.length;
+    if (cx - w / 2 < lastRight + 3) return; lastRight = cx + w / 2;
+    const t = svg("text", { class: "clabel", x: cx, y: labelY, tabindex: 0, role: "button", "aria-label": "Filter class " + lab });
+    t.textContent = lab; t.style.setProperty("--h", classHue(i, state.labels.length));
+    t.addEventListener("click", () => toggleClass(lab));
+    t.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleClass(lab); } });
+    s.append(t);
+  });
+  const xsAll = cars.map((r) => X(r.score)), tip = $("tip");
+  s.addEventListener("mousemove", (e) => {
+    const rect = s.getBoundingClientRect(), mx = (e.clientX - rect.left) * (W / rect.width);
+    let lo = 0, hi = xsAll.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (xsAll[mid] < mx) lo = mid + 1; else hi = mid; }
+    const k = lo > 0 && Math.abs(xsAll[lo - 1] - mx) < Math.abs(xsAll[lo] - mx) ? lo - 1 : lo;
+    if (Math.abs(xsAll[k] - mx) > 7) { tip.hidden = true; return; }
+    const r = cars[k];
+    tip.replaceChildren(r.name, el("small", {}, "Class " + r.cls + ", rating " + fmtPct(r.score)));
+    tip.hidden = false;
+    const hr = host.getBoundingClientRect();
+    tip.style.left = (e.clientX - hr.left) + "px"; tip.style.top = (e.clientY - hr.top - 12 + host.offsetTop) + "px";
+  });
+  s.addEventListener("mouseleave", () => { tip.hidden = true; });
+  host.append(s);
+  if (tip.parentNode !== host) host.append(tip);
+}
+
+function columns() {
+  const cols = [{ key: "cls", label: "Class" }, { key: "name", label: "Car" }, { key: "status", label: "Status" },
+                { key: "score", label: "Rating", num: true }, { key: "gap", label: "Gap", num: true }];
+  for (const t of state.tracks) cols.push({ key: "t:" + t, label: t, track: t, num: true });
+  cols.push({ key: "flags", label: "Flags" });
+  return cols;
+}
+function renderTable() {
+  const head = $("tbl").tHead, body = $("tbl").tBodies[0], cols = columns();
+  head.replaceChildren(); body.replaceChildren();
+  const tr = el("tr");
+  for (const c of cols) {
+    const sorted = state.sort.key === c.key;
+    const lab = c.track ? trackParts(c.track) : [c.label, ""];
+    const th = el("th", { scope: "col", class: c.num ? "num" : "", "aria-sort": sorted ? (state.sort.dir > 0 ? "ascending" : "descending") : "none" },
+      el("button", { type: "button", onclick: () => { state.sort = { key: c.key, dir: sorted ? -state.sort.dir : 1 }; renderAll(); } },
+         lab[0], lab[1] ? el("span", { class: "sub" }, lab[1]) : null));
+    tr.append(th);
+  }
+  head.append(tr);
+  const total = state.view.length, show = state.view.slice(0, state.shown);
+  $("count").textContent = "Showing " + show.length + " of " + total + " matching (" + state.rows.length + " cars)";
+  if (!total) { body.append(el("tr", {}, el("td", { colspan: cols.length, class: "empty" }, "No cars match. Clear the search or filters to see more."))); }
+  for (const r of show) {
+    const idx = r.cls ? clsIndex(r.cls) : 0;
+    const chip = el("span", { class: "cls" + (r.cls ? "" : " none") }, r.cls || "none");
+    if (r.cls) chip.style.setProperty("--h", classHue(idx, state.labels.length));
+    const row = el("tr", { class: "car", tabindex: 0, "aria-expanded": state.open.has(r.hash),
+      onclick: () => toggleRow(r), onkeydown: (e) => { if (e.key === "Enter") toggleRow(r); } },
+      el("td", {}, chip),
+      el("td", {}, el("span", { class: "name" }, r.name), el("span", { class: "sub" }, r.id)),
+      el("td", {}, el("span", { class: "st " + r.status }, r.status || "unknown")),
+      el("td", { class: "num" }, fmtPct(r.score)), el("td", { class: "num" }, fmtPct(r.gap)));
+    for (const t of state.tracks)
+      row.append(el("td", { class: "num" }, fmtTime(r.times[t]), r.deltas[t] === null ? null : el("span", { class: "sub" }, fmtPct(r.deltas[t], true))));
+    row.append(el("td", { class: "flags" }, r.flags.join("; ")));
+    body.append(row);
+    if (state.open.has(r.hash)) body.append(detailRow(r, cols.length));
+  }
+  const more = $("more");
+  more.hidden = total <= show.length;
+  more.textContent = "Show " + Math.min(PAGE, total - show.length) + " more";
+}
+function detailRow(r, span) {
+  const g = el("div", { class: "dgrid" });
+  const item = (k, v, cls) => g.append(el("div", {}, el("b", {}, k), el("span", { class: cls || "" }, v)));
+  item("Physics hash", r.hash, "hash");
+  for (const t of state.tracks) {
+    const parts = [fmtTime(r.times[t]) || "no time"];
+    if (r.deltas[t] !== null) parts.push(fmtPct(r.deltas[t], true) + " behind the reference");
+    if (r.n[t] !== null) parts.push(r.n[t] + " agreeing submission" + (r.n[t] === 1 ? "" : "s"));
+    item(t, parts.join(", "));
+  }
+  if (r.variance !== null) item("Track-to-track difference", fmtPct(r.variance));
+  if (r.flags.length) item("Flags", r.flags.join("; "));
+  if (r.bop) item("Balance of performance hint", r.bop);
+  if (r.updated) item("Last updated", stamp(r.updated));
+  return el("tr", { class: "detail" }, el("td", { colspan: span }, g));
+}
+function toggleRow(r) { if (state.open.has(r.hash)) state.open.delete(r.hash); else state.open.add(r.hash); renderTable(); }
+
+/* ------------------------------------------------------------------ loading */
+function normaliseServer(text) {
+  let u;
+  try { u = new URL(text.trim()); } catch (e) { throw new Error("Enter the server address, for example https://your-server.example"); }
+  if (u.protocol !== "https:" && u.protocol !== "http:") throw new Error("The address must start with https://");
+  return u.origin + u.pathname.replace(/\/v1\/classes\/?$/, "").replace(/\/+$/, "");
+}
+async function loadServer(text) {
+  let base;
+  try { base = normaliseServer(text); } catch (e) { setMsg(e.message, true); return; }
+  const url = base + "/v1/classes";
+  setMsg("Loading " + url + " ...");
+  let data;
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error("The server answered " + res.status + ".");
+    data = await res.json();
+  } catch (e) {
+    const blocked = e instanceof TypeError;       // the browser refused or could not reach the server
+    setMsg("Could not read " + url + ". " + (blocked
+      ? "If this page is not served from the same domain, the server's proxy has to send Access-Control-Allow-Origin on the read-only endpoints (see the README). You can also use Load file with a saved class file."
+      : e.message), true);
+    return;
+  }
+  try {
+    setData(data, { source: base });
+  } catch (e) { setMsg("The server's answer could not be used: " + e.message, true); return; }
+  try { localStorage.setItem("acb_results_server", base); } catch (e) { /* storage may be blocked */ }
+}
+async function loadFile(file) {
+  try { setData(JSON.parse(await file.text()), { source: file.name }); }
+  catch (e) { setMsg("Could not read " + file.name + ". " + e.message, true); }
+}
+
+/* ------------------------------------------------------------------ publish */
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = el("a", { href: url, download: name }); document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  toast("Saved " + name);
+}
+const dayStamp = () => new Date().toISOString().slice(0, 10);
+function toCsv() {
+  const head = ["class", "car", "folder", "status", "rating_pct", "gap_pct"];
+  for (const t of state.tracks) head.push("time_" + t.replace("/", "_"));
+  for (const t of state.tracks) head.push("delta_pct_" + t.replace("/", "_"));
+  head.push("variance_pct", "flags", "bop", "car_hash");
+  const lines = [head.join(",")];
+  for (const r of state.view) {
+    const line = [csvCell(r.cls || "", true), csvCell(r.name, true), csvCell(r.id, true), csvCell(r.status, true),
+                  csvCell(r.score === null ? "" : r.score.toFixed(3)), csvCell(r.gap === null ? "" : r.gap.toFixed(3))];
+    for (const t of state.tracks) line.push(csvCell(fmtTime(r.times[t])));
+    for (const t of state.tracks) line.push(csvCell(r.deltas[t] === null ? "" : r.deltas[t].toFixed(3)));
+    line.push(csvCell(r.variance === null ? "" : r.variance.toFixed(3)), csvCell(r.flags.join("; "), true), csvCell(r.bop, true), csvCell(r.hash, true));
+    lines.push(line.join(","));
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+function toMarkdown() {
+  const out = ["# AC Bench class results", ""];
+  if (state.table) out.push("Class table v" + state.table.version + ", " + state.rows.filter((r) => r.cls).length + " classified cars. Class A is the fastest.", "");
+  const groups = new Map();
+  for (const r of state.view) if (r.cls) { if (!groups.has(r.cls)) groups.set(r.cls, []); groups.get(r.cls).push(r); }
+  for (const lab of [...groups.keys()].sort((a, b) => clsIndex(a) - clsIndex(b))) {
+    const list = groups.get(lab);
+    out.push("### Class " + lab + " (" + list.length + " car" + (list.length === 1 ? "" : "s") + ")", "");
+    out.push("| Car | Rating | " + state.tracks.map(mdCell).join(" | ") + " | Flags |");
+    out.push("|---|---:|" + state.tracks.map(() => "---:|").join("") + "---|");
+    for (const r of list)
+      out.push("| " + mdCell(r.name) + " | " + fmtPct(r.score) + " | " + state.tracks.map((t) => fmtTime(r.times[t])).join(" | ") + " | " + mdCell(r.flags.join("; ")) + " |");
+    out.push("");
+  }
+  return out.join("\n");
+}
+function toJson() {
+  return JSON.stringify({ exported: Math.floor(Date.now() / 1000), source: state.source, profile: state.data.profile, tracks: state.tracks,
+    table: state.table, cars: state.view.map((r) => r.raw) }, null, 2);
+}
+function snapshotHtml() {
+  const json = JSON.stringify(state.data).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+  return SRC.replace(/<script id="embedded-data" type="application\/json">[\s\S]*?<\/script>/,
+    () => '<script id="embedded-data" type="application/json">' + json + "<\/script>");
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; }
+  catch (e) {
+    const ta = el("textarea", { style: "position:fixed;opacity:0" }); ta.value = text; document.body.append(ta); ta.select();
+    let ok = false; try { ok = document.execCommand("copy"); } catch (e2) { ok = false; }
+    ta.remove(); return ok;
+  }
+}
+
+/* ------------------------------------------------------------------ wiring */
+$("srcform").addEventListener("submit", (e) => { e.preventDefault(); loadServer($("srv").value); });
+$("file").addEventListener("change", (e) => { if (e.target.files[0]) loadFile(e.target.files[0]); e.target.value = ""; });
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", (e) => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+$("q").addEventListener("input", (e) => { state.f.q = e.target.value; state.shown = PAGE; computeView(); renderTable(); });
+$("status").addEventListener("change", (e) => { state.f.status = e.target.value; state.shown = PAGE; computeView(); renderTable(); });
+$("flagged").addEventListener("change", (e) => { state.f.flagged = e.target.checked; state.shown = PAGE; computeView(); renderTable(); });
+$("more").addEventListener("click", () => { state.shown += PAGE; renderTable(); });
+$("b-snap").addEventListener("click", () => download("ac-bench-results-" + dayStamp() + ".html", snapshotHtml(), "text/html"));
+$("b-csv").addEventListener("click", () => download("ac-bench-results-" + dayStamp() + ".csv", toCsv(), "text/csv"));
+$("b-json").addEventListener("click", () => download("ac-bench-results-" + dayStamp() + ".json", toJson(), "application/json"));
+$("b-md").addEventListener("click", async () => toast((await copyText(toMarkdown())) ? "Copied Markdown for " + state.view.filter((r) => r.cls).length + " cars" : "Could not copy, your browser blocked it"));
+let resizeTimer; window.addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => state.data && renderStrip(), 150); });
+
+(function start() {
+  const embedded = $("embedded-data").textContent.trim();
+  if (embedded) {
+    try { setData(JSON.parse(embedded), { snapshot: true }); return; }
+    catch (e) { setMsg("The embedded data is damaged: " + e.message, true); }
+  }
+  let saved = ""; try { saved = localStorage.getItem("acb_results_server") || ""; } catch (e) { /* ignore */ }
+  $("srv").value = saved || DEFAULT_SERVER;
+  setMsg("Load the results from your server, or open a saved class file.");
+  if (/^https?:$/.test(location.protocol) || DEFAULT_SERVER) loadServer($("srv").value);
+})();
+</script>
+</body>
+</html>
