@@ -79,7 +79,7 @@ function usersView() {
     const rows = j.users.map(u => h("tr", {},
       h("td", {}, u.name), h("td", {}, h("span", { class: "tag" }, u.role)),
       h("td", { class: u.banned ? "bad" : "ok" }, u.banned ? "banned" : "active"),
-      h("td", {}, u.submissions), h("td", { class: "mut" }, when(u.created)),
+      h("td", {}, u.submissions), h("td", {}, u.devices), h("td", { class: "mut" }, when(u.created)),
       h("td", {}, h("div", { class: "row" },
         u.banned ? btn("Unban", () => act("users/" + u.id + "/unban", {}, r => "Unbanned, " + r.recomputed + " entries recomputed"))
                  : btn("Ban", () => act("users/" + u.id + "/ban", {}, r => "Banned, " + r.recomputed + " entries recomputed"), "danger"),
@@ -88,7 +88,7 @@ function usersView() {
     const first = j.total ? j.offset + 1 : 0, last = j.offset + j.users.length;
     const go = off => { usersState.offset = Math.max(0, off); refresh().catch(e => toast("Error: " + e.message)); };
     body.replaceChildren(
-      h("table", {}, h("tr", {}, ["Name", "Role", "Status", "Submissions", "Created", ""].map(x => h("th", {}, x))), rows),
+      h("table", {}, h("tr", {}, ["Name", "Role", "Status", "Submissions", "Devices", "Created", ""].map(x => h("th", {}, x))), rows),
       h("div", { class: "row" }, h("span", { class: "mut" }, first + "–" + last + " of " + j.total),
         j.offset > 0 ? btn("Previous", () => go(j.offset - j.limit)) : "",
         last < j.total ? btn("Next", () => go(j.offset + j.limit)) : ""));

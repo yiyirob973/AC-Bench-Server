@@ -291,3 +291,12 @@ Codes look like `54TE-7JWY-TSXD-8T9K` (16 characters, no look-alikes such as 0/O
 them as pasted or typed: lowercase, without the hyphens, with surrounding spaces/newlines/quotes. Codes made by older
 versions still work exactly as they were issued. The error says whether the code is unknown (incomplete copy, or a
 different server than the one that issued it) or has been used up or revoked.
+
+
+## Same account on another device
+
+There is no password: an account is an API key kept in the app's `cloud_config.json`. To use the account on another PC,
+the signed-in app calls `POST /v1/devices/link` and gets a single-use code (`XXXX-XXXX-XXXX`, valid 10 minutes, only the
+newest code works). The new device sends it to `POST /v1/devices/redeem` and receives its own API key for the same
+account (stored in `user_keys`, so every device has a separate key). Banning the account disables all its devices; the
+admin users table shows how many devices an account has.

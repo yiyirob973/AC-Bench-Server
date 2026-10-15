@@ -24,6 +24,8 @@ Admin web UI
 
 Benchmark conditions (public, no key needed)
   POST /v1/submit  -> {"accepted", "rejected", "merged_status", "cars": [class record of each car just touched], ...}
+  POST /v1/devices/link    (key needed) -> a single-use code, valid 10 minutes, to sign in on another device
+  POST /v1/devices/redeem  {"code": ...} -> a new API key for the same account (the other device's own key)
   POST /v1/cars/lookup  {"hashes": [up to 500 car physics hashes]} -> live records for only those cars (no key needed)
   GET /v1/conditions  profile, tracks, laps, batch limit, free-form "conditions" and the reference environment
                       the server will accept; has an ETag, so clients can revalidate with If-None-Match.
@@ -84,6 +86,11 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL, key_hash TEXT UNIQUE NOT NULL,
   role TEXT NOT NULL DEFAULT 'user', banned INTEGER NOT NULL DEFAULT 0, created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS user_keys (          -- extra API keys of one account: one per signed-in device
+  key_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), label TEXT NOT NULL DEFAULT '',
+  created INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS device_links (       -- short-lived single-use codes to sign in on another device
+  code_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS invites (
   code_hash TEXT PRIMARY KEY, role TEXT NOT NULL, uses_left INTEGER NOT NULL, created INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS submissions (
@@ -498,7 +505,11 @@ def authenticate(db, environ):
     header = environ.get("HTTP_AUTHORIZATION", "")
     if not header.startswith("Bearer ") or len(header) > 200:
         raise HttpError(401, "missing API key")
-    user = db.execute("SELECT id, name, role, banned FROM users WHERE key_hash=?", (sha(header[7:].strip()),)).fetchone()
+    kh = sha(header[7:].strip())
+    user = db.execute("SELECT id, name, role, banned FROM users WHERE key_hash=?", (kh,)).fetchone()
+    if not user:   # a key issued to another device of the same account
+        user = db.execute("SELECT u.id, u.name, u.role, u.banned FROM user_keys k JOIN users u ON u.id=k.user_id "
+                          "WHERE k.key_hash=?", (kh,)).fetchone()
     if not user:
         raise HttpError(401, "unknown API key")
     if user["banned"]:
@@ -593,6 +604,45 @@ def handle_register(db, cfg, environ):
     db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=?", (code_hash,))
     db.commit()
     return respond(201, {"api_key": key, "name": name, "role": row["role"]})
+
+
+LINK_TTL = 600   # seconds a device link code stays valid
+
+
+def handle_link(db, cfg, environ):
+    """Signed-in device asks for a code that lets ANOTHER device sign in as the same account (single use, 10 minutes)."""
+    user = authenticate(db, environ)
+    rate_limit(db, "user:%d" % user["id"], "link", 10)
+    raw = "".join(secrets.choice(INVITE_ALPHABET) for _ in range(12))
+    code = "-".join(raw[i:i + 4] for i in range(0, 12, 4))
+    t = now()
+    db.execute("DELETE FROM device_links WHERE created<? OR user_id=?", (t - LINK_TTL, user["id"]))   # only the newest code works
+    db.execute("INSERT INTO device_links(code_hash, user_id, created) VALUES(?,?,?)", (invite_hash(code), user["id"], t))
+    db.commit()
+    return respond(201, {"code": code, "expires_in": LINK_TTL, "name": user["name"]})
+
+
+def handle_redeem(db, cfg, environ):
+    """New device presents a link code and receives its own API key for the same account (no API key needed yet)."""
+    data = read_json(environ, cfg)
+    rate_limit(db, "ip:" + client_ip(environ, cfg), "redeem", cfg["rate_register_per_hour"])
+    code, label = data.get("code"), data.get("label", "")
+    if not isinstance(code, str) or not isinstance(label, str):
+        raise HttpError(400, "code is required")
+    h = sha(re.sub(r"[-\s\u200b-\u200d\u2060\ufeff]+", "", code).strip("\"'`<>").upper())
+    row = db.execute("SELECT l.user_id, l.created, u.name, u.role, u.banned FROM device_links l "
+                     "JOIN users u ON u.id=l.user_id WHERE l.code_hash=?", (h,)).fetchone()
+    if not row or now() - row["created"] > LINK_TTL:
+        raise HttpError(403, "unknown or expired link code: create a new one on the signed-in device "
+                             "(codes work once and for %d minutes)" % (LINK_TTL // 60))
+    if row["banned"]:
+        raise HttpError(403, "this account is banned")
+    db.execute("DELETE FROM device_links WHERE code_hash=?", (h,))
+    key = "acb_" + secrets.token_urlsafe(32)
+    db.execute("INSERT INTO user_keys(key_hash, user_id, label, created) VALUES(?,?,?,?)",
+               (sha(key), row["user_id"], label.strip()[:40], now()))
+    db.commit()
+    return respond(201, {"api_key": key, "name": row["name"], "role": row["role"]})
 
 
 def handle_submit(db, cfg, environ):
@@ -723,6 +773,10 @@ def route(environ, db_path):
             return respond(200, public_config(cfg, db))
         if method == "POST" and path == "/v1/register":
             return handle_register(db, cfg, environ)
+        if method == "POST" and path == "/v1/devices/link":
+            return handle_link(db, cfg, environ)
+        if method == "POST" and path == "/v1/devices/redeem":
+            return handle_redeem(db, cfg, environ)
         if method == "POST" and path == "/v1/submit":
             return handle_submit(db, cfg, environ)
         if method == "GET" and path == "/v1/classes":

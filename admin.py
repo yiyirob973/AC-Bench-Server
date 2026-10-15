@@ -335,7 +335,8 @@ def list_users(db, ctx, environ):
     total = db.execute("SELECT COUNT(*) FROM users u " + where, args).fetchone()[0]
     users = [dict(r) for r in db.execute(
         "SELECT u.id, u.name, u.role, u.banned, u.created, "
-        "(SELECT COUNT(*) FROM submissions s WHERE s.user_id=u.id) AS submissions FROM users u " + where +
+        "(SELECT COUNT(*) FROM submissions s WHERE s.user_id=u.id) AS submissions, "
+        "1 + (SELECT COUNT(*) FROM user_keys k WHERE k.user_id=u.id) AS devices FROM users u " + where +
         " ORDER BY u.created DESC, u.id DESC LIMIT ? OFFSET ?", args + [limit, offset])]
     return {"users": users, "total": total, "limit": limit, "offset": offset}
 
