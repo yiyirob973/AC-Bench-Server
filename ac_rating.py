@@ -1,13 +1,10 @@
 """
 Class assignment from benchmark results (implements grid_dynamics.txt).
 
-Pipeline
- 1. Lap scoring   : drop lap 1 (standing start), score a car on a track by the MEDIAN of its
-                    timed laps (not the single fastest lap), which filters drafting spikes,
-                    curb errors and AI stutters.
- 2. Normalisation : per track, express every car as a % delta to the fastest car on that track;
-                    a car's rating is the MEAN delta over all test tracks.
- 3. Class borders : natural breaks, not fixed time steps.
+How a class table is cut
+ 1. Normalisation : per track, express every car as a % delta to the fastest car on that track;
+                    a car's rating is the mean delta over all the benchmark tracks.
+ 2. Class borders : natural breaks, not fixed time steps.
       a. Gap analysis  : a hole in the performance spectrum of at least 30% of a class width
                          (and 6x the typical gap) is a class border, unless that would leave a
                          stretch with fewer than min_size cars that can be merged into a neighbour.
@@ -17,37 +14,22 @@ Pipeline
       c. Nudging       : each Jenks cut may slide to the largest gap in its feasible range, so
                          near-identical cars are not split when a cleaner gap is available.
     Work is done on ln(1 + delta/100) so a "2% class" means 2% of lap time everywhere.
- 4. Quality flags : borderline cars (inside the tie zone of a class border, or inside their own
-                    lap-to-lap noise), high-variance cars (delta differs between tracks by more
-                    than the class spread: keep the class, balance with ballast/restrictor) and
-                    the lap-time slowdown that BoP would have to deliver on the track where the
-                    car beats its class.
-Pure standard library.
+
+The borderline / high-variance flags and the balance hints are not worked out here: the server derives
+them per car from the published table (see classify in server.py). Pure standard library.
 """
-import bisect, math, statistics
+import math, statistics
 
-from ac_car_classifier import class_label
-
-MIN_TIMED = 3
 INF = float("inf")
 EPS = 1e-12
 
 
-# ---------------------------------------------------------------- lap scoring
-def timed_laps(entry):
-    """Valid timed laps in ms: every recorded lap except lap 1."""
-    laps = entry.get("laps_ms") or []
-    return [t for t in laps[1:] if isinstance(t, (int, float)) and t > 0]
-
-
-def lap_score(entry):
-    """-> (median timed lap in ms, number of timed laps). Old entries without lap lists fall back to best_ms."""
-    timed = timed_laps(entry)
-    if timed:
-        return float(statistics.median(timed)), len(timed)
-    if entry.get("best_ms"):
-        return float(entry["best_ms"]), 0
-    return None, 0
+def class_label(n):
+    """Class number -> label. Two-letter codes (AA, AB, ...) made a search for class "A" match other classes,
+    so labels are <group><letter>: 1 -> 1A (top class), 2 -> 1B, ... 26 -> 1Z, 27 -> 2A, ... 52 -> 2Z, 53 -> 3A."""
+    if n < 1:
+        return ""
+    return "%d%s" % ((n - 1) // 26 + 1, chr(65 + (n - 1) % 26))
 
 
 # ---------------------------------------------------------------- 1-D optimal breaks (Fisher-Jenks)
@@ -136,17 +118,6 @@ def constrained_jenks(y, w, m):
     return [(i, i) for i in range(n)]
 
 
-def fixed_partition(y, k, m):
-    """Plain Jenks into exactly k classes (no width limit)."""
-    n = len(y)
-    k = max(1, min(k, n))
-    m = max(1, min(m, n // k))
-    D, P = _dp_tables(y, None, m, k)
-    if D[k][n - 1] < INF:
-        return _backtrack(P, n, k)
-    return [(i, i) for i in range(n)]
-
-
 # ---------------------------------------------------------------- natural class borders
 def natural_classes(y, w, m, sig_mult=6.0, sig_frac=0.3):
     """Gap analysis, then constrained Jenks inside each stretch. -> (classes, significant gap)."""
@@ -213,76 +184,38 @@ def nudge_cuts(y, classes, w, m, ratio=1.5, passes=4):
 
 
 # ---------------------------------------------------------------- main entry
-def rate(results, tracks, class_gap=2.0, min_size=3, fixed_k=0, tie_zone=0.10, sensitivity=None,
-         masses=None, allow_partial=False, current_only=False, profile=None, nudge=True):
-    """results: {car: {track: entry}} (lap_results.json). -> (cars, summary).
-    cars[id]: cls, idx, score (mean delta %), gap (% behind the fastest rated car), times (median s per
-    track), deltas, variance, n_timed, noise (std. error of the median, % of lap time), flags (list),
-    flags_text, bop.
-    summary: classes [{label, n, lo, hi, width}], boundaries [{between, gap, kind}], warnings."""
+def rate(results, tracks, class_gap=2.0, min_size=3):
+    """results: {car: {track: score_ms}}. Cars that miss any of the tracks are left out.
+    -> (cars, summary).
+    cars[id]: id, deltas (% behind the fastest car, one per track), score (their mean), cls (class label).
+    summary: classes [{label, n, lo, hi, width, small}], warnings."""
     tracks = [t for t in tracks if t]
-    masses = masses or {}
-
-    def usable(e):
-        return e.get("status") == "ok" and (not current_only or e.get("profile") == profile)
-
-    scores, best = {}, {}
-    for car, per in results.items():
-        for t in tracks:
-            e = per.get(t) or {}
-            if not usable(e):
-                continue
-            ms, n = lap_score(e)
-            if ms is None:
-                continue
-            timed = timed_laps(e)
-            # standard error of the median score, in % of lap time: how far the score could move on a re-run
-            spread = (1.2533 * statistics.stdev(timed) / math.sqrt(len(timed)) / ms * 100) if len(timed) > 1 else 0.0
-            scores[(car, t)] = (ms, n, spread)
-            if t not in best or ms < best[t]:
-                best[t] = ms
-
+    best = {t: min(per[t] for per in results.values() if t in per) for t in tracks
+            if any(t in per for per in results.values())}
     cars = {}
-    for car in results:
-        have = [t for t in tracks if (car, t) in scores]
-        if not have or (len(have) < len(tracks) and not allow_partial):
+    for car, per in results.items():
+        if not all(t in per for t in tracks):
             continue
-        deltas = [(scores[(car, t)][0] / best[t] - 1) * 100 if (car, t) in scores else None for t in tracks]
-        valid = [d for d in deltas if d is not None]
-        cars[car] = {
-            "id": car, "deltas": deltas, "score": sum(valid) / len(valid),
-            "times": [scores[(car, t)][0] / 1000 if (car, t) in scores else None for t in tracks],
-            "n_timed": min(scores[(car, t)][1] for t in have),
-            "noise": max(scores[(car, t)][2] for t in have),
-            "variance": 0.0, "flags": [], "flags_text": "", "bop": "", "cls": None, "idx": None, "gap": 0.0,
-        }
-    summary = {"classes": [], "boundaries": [], "warnings": [], "k": 0}
+        deltas = [(per[t] / best[t] - 1) * 100 for t in tracks]
+        cars[car] = {"id": car, "deltas": deltas, "score": sum(deltas) / len(deltas), "cls": None}
+    summary = {"classes": [], "warnings": []}
     order = sorted(cars.values(), key=lambda c: (c["score"], c["id"]))
-    n = len(order)
-    if n == 0:
+    if not order:
         return cars, summary
 
-    if not fixed_k and (not class_gap or class_gap <= 0):
+    if not class_gap or class_gap <= 0:
         class_gap = 2.0
     y = [math.log1p(c["score"] / 100) for c in order]
     m_req = max(1, int(min_size))
-
-    # --- class borders
-    g_sig = None
-    if fixed_k and fixed_k > 0:
-        classes = fixed_partition(y, int(fixed_k), m_req)
-        width = None
-    else:
-        width = math.log1p(class_gap / 100)
-        classes, g_sig = natural_classes(y, width, m_req)
-    if nudge and len(classes) > 1:
+    width = math.log1p(class_gap / 100)
+    classes, _ = natural_classes(y, width, m_req)
+    if len(classes) > 1:
         classes = nudge_cuts(y, classes, width, m_req)
-    summary["k"] = len(classes)
 
     labels = [class_label(i + 1) for i in range(len(classes))]
     for idx, (a, b) in enumerate(classes):
         for i in range(a, b + 1):
-            order[i]["cls"], order[i]["idx"] = labels[idx], idx
+            order[i]["cls"] = labels[idx]
         small = (b - a + 1) < m_req
         summary["classes"].append({
             "label": labels[idx], "n": b - a + 1, "lo": order[a]["score"], "hi": order[b]["score"],
@@ -290,65 +223,6 @@ def rate(results, tracks, class_gap=2.0, min_size=3, fixed_k=0, tie_zone=0.10, s
         if small:
             summary["warnings"].append(f"class {labels[idx]} has only {b - a + 1} car(s) (min {m_req}): "
                                        "cars on both sides are too far apart to merge within the max spread")
-        if width is not None and y[b] - y[a] > width + 1e-9:
+        if y[b] - y[a] > width + 1e-9:
             summary["warnings"].append(f"class {labels[idx]} is wider than the max spread")
-    for c in order:
-        c["gap"] = (math.exp(math.log1p(c["score"] / 100) - y[0]) - 1) * 100
-
-    # --- boundaries and borderline cars
-    mids = []
-    for t in range(len(classes) - 1):
-        c = classes[t][1]
-        gap_y = y[c + 1] - y[c]
-        kind = "natural gap" if (g_sig is not None and gap_y >= g_sig - EPS) else "cut"
-        summary["boundaries"].append({"between": labels[t] + "/" + labels[t + 1],
-                                      "gap": (math.exp(gap_y) - 1) * 100, "kind": kind})
-        mids.append((y[c] + y[c + 1]) / 2)
-    if mids:
-        for i, car in enumerate(order):
-            pos = bisect.bisect(mids, y[i])
-            near = [p for p in (pos - 1, pos) if 0 <= p < len(mids)]
-            p = min(near, key=lambda q: abs(y[i] - mids[q]))
-            dist = (math.exp(abs(y[i] - mids[p])) - 1) * 100
-            if dist < max(tie_zone, car["noise"]):
-                car["flags"].append("borderline " + summary["boundaries"][p]["between"] + f" ({dist:.2f}%)")
-
-    # --- variance and BoP hints
-    n_tracks = len(tracks)
-    for idx, (a, b) in enumerate(classes):
-        members = order[a:b + 1]
-        norms = []
-        for ti in range(n_tracks):
-            vals = [c["deltas"][ti] for c in members if c["deltas"][ti] is not None]
-            norms.append(statistics.median(vals) if vals else None)
-        for car in members:
-            valid = [d for d in car["deltas"] if d is not None]
-            car["variance"] = (max(valid) - min(valid)) if len(valid) > 1 else 0.0
-            if len(valid) > 1 and class_gap and car["variance"] > class_gap:
-                car["flags"].append(f"high variance ({car['variance']:.1f}%)")
-                bits = []
-                for ti, t in enumerate(tracks):
-                    d = car["deltas"][ti]
-                    if d is None or norms[ti] is None:
-                        continue
-                    excess = norms[ti] - d            # > 0: quicker than its class on this track
-                    if excess > 0.25 * class_gap:
-                        bits.append(_bop_text(t, excess, car["id"], sensitivity, masses))
-                car["bop"] = "; ".join(bits)
-    for car in order:
-        car["flags_text"] = "; ".join(car["flags"])
-        if car["n_timed"] and car["n_timed"] < MIN_TIMED:
-            summary["warnings"].append(f"{car['id']}: only {car['n_timed']} timed lap(s), median is weak")
     return cars, summary
-
-
-def _bop_text(track, excess, car_id, sensitivity, masses):
-    name = track.partition("/")[0]
-    text = f"{name}: needs to be {excess:.2f}% slower"
-    if sensitivity and sensitivity > 0:
-        cut = excess / sensitivity                 # % power-to-weight change for that lap-time change
-        text += f" (~{cut:.1f}% restrictor"
-        if masses.get(car_id):
-            text += f" or ~{masses[car_id] * cut / 100:.0f} kg ballast"
-        text += ")"
-    return text

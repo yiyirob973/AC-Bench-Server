@@ -125,7 +125,7 @@ tr.detail td { background: color-mix(in srgb, var(--ink) 3%, transparent); }
 <div class="wrap">
   <header>
     <h1>AC Bench class results</h1>
-    <p class="lede" id="lede">Assetto Corsa cars grouped by AI lap time on fixed vanilla Kunos tracks. Class A is the fastest.</p>
+    <p class="lede" id="lede">Assetto Corsa cars grouped by AI lap time on fixed vanilla Kunos tracks. Class 1A is the fastest.</p>
   </header>
 
   <section class="panel" id="source" aria-label="Data source">
@@ -535,7 +535,7 @@ function toCsv() {
 }
 function toMarkdown() {
   const out = ["# AC Bench class results", ""];
-  if (state.table) out.push("Class table v" + state.table.version + ", " + state.rows.filter((r) => r.cls).length + " classified cars. Class A is the fastest.", "");
+  if (state.table) out.push("Class table v" + state.table.version + ", " + state.rows.filter((r) => r.cls).length + " classified cars. Class 1A is the fastest.", "");
   const groups = new Map();
   for (const r of state.view) if (r.cls) { if (!groups.has(r.cls)) groups.set(r.cls, []); groups.get(r.cls).push(r); }
   for (const lab of [...groups.keys()].sort((a, b) => clsIndex(a) - clsIndex(b))) {

@@ -118,6 +118,20 @@ The server is intentionally simple and conservative:
 
 This keeps the server auditable and easy to run without a large infrastructure stack.
 
+### Performance and concurrency
+
+- Each worker thread keeps one long-lived SQLite connection (WAL, `synchronous=NORMAL`). A power cut can lose the
+  last few commits but never corrupts the database; keep the daily backups.
+- The class table, `/v1/conditions` document and `/stats` page are cached per process and revalidated cheaply, so
+  unchanged requests cost almost nothing. `/v1/classes` and `/stats` are gzip-compressed (`Accept-Encoding: gzip`)
+  and support `If-None-Match` (strong or weak ETags).
+- While one thread rebuilds the `/v1/classes` export, other requests are served the previous export (at most one
+  rebuild old); with `export_max_age` 0 or after a new class table is published they wait for the fresh one.
+- Uploads are validated before the database write lock is taken, then written in one short transaction.
+- Scale with the compose/Docker environment: `WEB_CONCURRENCY` (worker processes, default 2) and
+  `GUNICORN_CMD_ARGS` (default `--worker-class gthread --threads 8 ...`). Roughly one worker per CPU core.
+- If you restore a database file by hand, restart the container (workers keep their connections open).
+
 ## Security and deployment notes
 
 - TLS is mandatory for any non-local deployment
@@ -243,14 +257,18 @@ Rate-limit events are short-lived and are purged after a period of time.
 ## Repository layout
 
 ```text
-README.md
+server.py            the API, the merging and the command line
+admin.py             /admin: PocketID login and the operator dashboard's API
+admin.html           the admin dashboard page
+ac_rating.py         cuts the class table (natural breaks) and names the classes
+stats.html           the public /stats page
 Dockerfile
-server.py
-stats.html
-selftest.py
+docker-compose.yml
+backup.sh            daily database backup, meant for cron
+README.md
 ```
 
-This repository is intentionally kept lean: server code and the public dashboard live at the root level, without a nested cloud_server directory.
+Everything sits at the root of the repository, and the server needs nothing beyond the Python standard library (gunicorn is added in the Docker image).
 
 ## Relationship to the desktop app
 
@@ -268,7 +286,8 @@ For most users, start with the [AC Bench Desktop app](https://github.com/yiyirob
 `POST /v1/cars/lookup` with `{"hashes": [...]}` (1-500 lowercase sha256 car physics hashes, no key needed) returns the
 current records for just those cars: `{"profile", "tracks", "table_version", "labels", "cars": [...]}`. Unknown cars are
 absent. Nothing is cached, so the answer is always current. Rate limit: `rate_lookups_per_hour` per IP (default 240,
-editable in the admin dashboard).
+editable in the admin dashboard), counted in memory by each worker process (so with N workers the effective
+limit can reach N x that).
 
 
 ## Class labels

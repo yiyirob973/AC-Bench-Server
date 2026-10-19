@@ -47,7 +47,7 @@ What the server does with it
     so a car's class does not move when other cars are added. Publish a new table deliberately.
 """
 
-import argparse, bisect, hashlib, json, math, os, re, secrets, sqlite3, statistics, sys, threading, time
+import argparse, bisect, collections, functools, gzip, hashlib, json, math, os, re, secrets, sqlite3, statistics, sys, threading, time
 from http import HTTPStatus
 from pathlib import Path
 from socketserver import ThreadingMixIn
@@ -55,11 +55,10 @@ from types import SimpleNamespace
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 HERE = Path(__file__).resolve().parent
-for _p in (HERE.parent, HERE):  # share ac_rating.py / ac_car_classifier.py with the desktop tool
-    sys.path.insert(0, str(_p))
+sys.path.insert(0, str(HERE))
 import ac_rating  # noqa: E402
 import admin  # noqa: E402
-from ac_car_classifier import class_label  # noqa: E402
+from ac_rating import class_label  # noqa: E402
 
 API_VERSION = 1
 DEFAULT_CONFIG = {
@@ -130,11 +129,34 @@ def sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+class Conn(sqlite3.Connection):
+    path = None   # which database file this connection belongs to (keys the per-process caches)
+
+
 def connect(path):
-    db = sqlite3.connect(str(path), timeout=15)
+    db = sqlite3.connect(str(path), timeout=15, factory=Conn)
+    db.path = str(path)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")     # safe with WAL (no corruption; a power cut can lose the last commits)
     db.execute("PRAGMA foreign_keys=ON")
+    db.execute("PRAGMA temp_store=MEMORY")
+    db.execute("PRAGMA cache_size=-4000")       # 4 MB page cache per connection
+    db.execute("PRAGMA mmap_size=134217728")    # read through the OS page cache, shared by all connections
+    return db
+
+
+_local = threading.local()
+
+
+def request_db(path):
+    """One long-lived connection per worker thread: no connect/close (and no WAL checkpoint on close) per request."""
+    conns = getattr(_local, "conns", None)
+    if conns is None:
+        conns = _local.conns = {}
+    db = conns.get(path)
+    if db is None:
+        db = conns[path] = connect(path)
     return db
 
 
@@ -149,11 +171,16 @@ def init_db(path):
     return db
 
 
+class Cfg(dict):
+    raw = None    # the stored JSON this config was read from (lets handlers cache what they derive from it)
+
+
 def get_config(db):
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = Cfg(DEFAULT_CONFIG)
     row = db.execute("SELECT v FROM meta WHERE k='config'").fetchone()
     if row:
         cfg.update(json.loads(row["v"]))
+        cfg.raw = row["v"]
     return cfg
 
 
@@ -174,13 +201,24 @@ def data_version(db):
     return int(row["v"]) if row else 0
 
 
+_table_cache = {}   # database path -> (version, parsed table); tables are immutable once published
+
+
 def latest_table(db):
-    row = db.execute("SELECT version, created, body FROM class_tables ORDER BY version DESC LIMIT 1").fetchone()
+    """The newest class table. The returned dict is shared between requests: treat it as read-only."""
+    top = db.execute("SELECT MAX(version) AS v FROM class_tables").fetchone()["v"]
+    if top is None:
+        return None
+    hit = _table_cache.get(db.path)
+    if hit and hit[0] == top:
+        return hit[1]
+    row = db.execute("SELECT version, created, body FROM class_tables WHERE version=?", (top,)).fetchone()
     if not row:
         return None
     body = json.loads(row["body"])
     # tables published before the 1A..1Z, 2A.. scheme stored letter labels (A, B, ... AA): same classes, new names
     body["labels"] = [class_label(i + 1) for i in range(len(body.get("labels", [])))]
+    _table_cache[db.path] = (top, body)
     return body
 
 
@@ -287,7 +325,8 @@ def validate_entry(e, cfg, envs, refs):
 # ------------------------------------------------------------------ merge
 
 def recompute(db, cfg, car_hash, track):
-    """Agreement between users for one car on one track. Updates submissions.used and merged.
+    """Agreement between users for one car on one track. Updates submissions.used and merged; returns the new
+    merged status (None when the car has no submissions left).
 
     Picks the biggest group of submissions that agree with each other (ties: the tightest, then the first row).
     Done on the sorted scores with binary search, O(n log n) instead of comparing every pair."""
@@ -296,7 +335,7 @@ def recompute(db, cfg, car_hash, track):
         "WHERE s.car_hash=? AND s.track=? AND u.banned=0", (car_hash, track)).fetchall()
     if not rows:
         db.execute("DELETE FROM merged WHERE car_hash=? AND track=?", (car_hash, track))
-        return
+        return None
     tol = cfg["tolerance_pct"] / 100
     ordered = sorted(rows, key=lambda r: r["score_ms"])
     scores = [r["score_ms"] for r in ordered]
@@ -337,9 +376,38 @@ def recompute(db, cfg, car_hash, track):
         "n_used=excluded.n_used, n_total=excluded.n_total, spread_pct=excluded.spread_pct, "
         "status=excluded.status, updated=excluded.updated",
         (car_hash, track, statistics.median(cl_scores), len(cluster), len(rows), spread, status, now()))
+    return status
 
 
 # ------------------------------------------------------------------ classes
+
+_label = functools.lru_cache(maxsize=None)(class_label)
+_cut_slot = (None, None)   # (cuts list, its log1p values): recomputed only when the class table changes
+
+
+def _cut_logs(cuts):
+    global _cut_slot
+    slot = _cut_slot
+    if slot[0] is cuts:
+        return slot[1]
+    logs = [math.log1p(c / 100) for c in cuts]
+    _cut_slot = (cuts, logs)
+    return logs
+
+
+def _nearest_cut(logs, y):
+    """Index of the cut closest to y in log space (the first one on an exact tie), by bisection: the cuts are sorted."""
+    i = bisect.bisect_left(logs, y)
+    if i == 0:
+        k = 0
+    elif i == len(logs):
+        k = len(logs) - 1
+    else:
+        k = i - 1 if abs(logs[i - 1] - y) <= abs(logs[i] - y) else i
+    while k > 0 and logs[k - 1] == logs[k]:
+        k -= 1
+    return k
+
 
 def classify(table, times_ms):
     """times_ms: {track: score_ms}. Class, gap and flags from the fixed class table."""
@@ -347,16 +415,17 @@ def classify(table, times_ms):
     deltas = {t: (times_ms[t] / table["refs_ms"][t] - 1) * 100 for t in tracks}
     score = sum(deltas.values()) / len(tracks)
     cuts = table["cuts"]
-    label = class_label(bisect.bisect_right(cuts, score) + 1)
+    label = _label(bisect.bisect_right(cuts, score) + 1)
     gap = ((1 + score / 100) / (1 + table["base_score"] / 100) - 1) * 100
     variance = max(deltas.values()) - min(deltas.values())
     flags, bop = [], ""
     if cuts:
+        logs = _cut_logs(cuts)
         y = math.log1p(score / 100)
-        k = min(range(len(cuts)), key=lambda i: abs(math.log1p(cuts[i] / 100) - y))
-        dist = (math.exp(abs(math.log1p(cuts[k] / 100) - y)) - 1) * 100
+        k = _nearest_cut(logs, y)
+        dist = (math.exp(abs(logs[k] - y)) - 1) * 100
         if dist < table["tie_zone"]:
-            flags.append("borderline %s/%s (%.2f%%)" % (class_label(k + 1), class_label(k + 2), dist))
+            flags.append("borderline %s/%s (%.2f%%)" % (_label(k + 1), _label(k + 2), dist))
     if variance > table["class_gap"]:
         flags.append("high variance (%.1f%%)" % variance)
     bits = []
@@ -375,19 +444,18 @@ def publish_classes(db, cfg, include_provisional=False):
     per_car = {}
     for r in db.execute("SELECT car_hash, track, score_ms, status FROM merged"):
         if r["status"] in wanted:
-            per_car.setdefault(r["car_hash"], {})[r["track"]] = {"status": "ok", "best_ms": r["score_ms"]}
+            per_car.setdefault(r["car_hash"], {})[r["track"]] = r["score_ms"]
     results = {h: v for h, v in per_car.items() if all(t in v for t in cfg["tracks"])}
     if len(results) < 2:
         raise SystemExit("Not enough cars with complete data (%d). Need at least 2." % len(results))
-    cars, summ = ac_rating.rate(results, cfg["tracks"], class_gap=cfg["class_gap"],
-                                min_size=cfg["min_class_size"], tie_zone=cfg["tie_zone"])
+    cars, summ = ac_rating.rate(results, cfg["tracks"], class_gap=cfg["class_gap"], min_size=cfg["min_class_size"])
     order = sorted(cars.values(), key=lambda c: (c["score"], c["id"]))
     cuts, pos = [], 0
     for cl in summ["classes"][:-1]:
         pos += cl["n"]
         y1, y2 = math.log1p(order[pos - 1]["score"] / 100), math.log1p(order[pos]["score"] / 100)
         cuts.append(math.expm1((y1 + y2) / 2) * 100)
-    refs = {t: min(v[t]["best_ms"] for v in results.values()) for t in cfg["tracks"]}
+    refs = {t: min(v[t] for v in results.values()) for t in cfg["tracks"]}
     labels = [class_label(i + 1) for i in range(len(summ["classes"]))]
     norms = {}
     for c in order:
@@ -407,12 +475,9 @@ def publish_classes(db, cfg, include_provisional=False):
     return body, summ
 
 
-_STATUS_RANK = {"disputed": 3, "provisional": 2, "verified": 1}
-
-
 def car_records(db, cfg, only_hash=None, only_hashes=None):
     table = latest_table(db)
-    q = "SELECT car_hash, track, score_ms, n_used, n_total, status, updated FROM merged"
+    q = "SELECT car_hash, track, score_ms, n_used, status, updated FROM merged"
     args = ()
     names_q, names_args = "SELECT car_hash, car_id, name FROM cars", ()
     if only_hashes is not None:
@@ -424,29 +489,31 @@ def car_records(db, cfg, only_hash=None, only_hashes=None):
         q, args = q + " WHERE car_hash=?", (only_hash,)
         names_q, names_args = names_q + " WHERE car_hash=?", (only_hash,)
     per_car = {}
-    for r in db.execute(q, args):
-        per_car.setdefault(r["car_hash"], {})[r["track"]] = r
-    names = {}
-    for r in db.execute(names_q, names_args):
-        names[r["car_hash"]] = (r["car_id"], r["name"])
+    cur = db.cursor()
+    cur.row_factory = None   # plain tuples: this loop runs once per car and per track
+    for h, track, score_ms, n_used, status, updated in cur.execute(q, args):
+        per_car.setdefault(h, {})[track] = (score_ms, n_used, status, updated)
+    names = {h: (car_id, name) for h, car_id, name in cur.execute(names_q, names_args)}
+    tracks = cfg["tracks"]
+    classed = table["tracks"] if table else None
     out = []
     for h, per in sorted(per_car.items()):
-        missing = [t for t in cfg["tracks"] if t not in per]
-        sts = [per[t]["status"] for t in per]
+        sts = [v[2] for v in per.values()]
         if "disputed" in sts:
             status = "disputed"
-        elif missing:
+        elif any(t not in per for t in tracks):
             status = "incomplete"
         elif "provisional" in sts:
             status = "provisional"
         else:
             status = "verified"
-        rec = {"car_hash": h, "car_id": names.get(h, ("", ""))[0], "name": names.get(h, ("", ""))[1],
-               "status": status, "times_ms": {t: per[t]["score_ms"] for t in per},
-               "n": {t: per[t]["n_used"] for t in per}, "updated": max(per[t]["updated"] for t in per),
+        car_id, name = names.get(h, ("", ""))
+        rec = {"car_hash": h, "car_id": car_id, "name": name,
+               "status": status, "times_ms": {t: v[0] for t, v in per.items()},
+               "n": {t: v[1] for t, v in per.items()}, "updated": max(v[3] for v in per.values()),
                "class": None}
         if table and status in ("verified", "provisional"):
-            rec.update(classify(table, {t: per[t]["score_ms"] for t in table["tracks"]}))
+            rec.update(classify(table, {t: per[t][0] for t in classed}))
         out.append(rec)
     return table, out
 
@@ -460,18 +527,43 @@ def respond(code, obj, extra=None):
     return code, body, headers
 
 
-def serve_file(path, content_type):
+def accepts_gzip(environ):
+    ae = environ.get("HTTP_ACCEPT_ENCODING", "")
+    return "gzip" in ae and not re.search(r"gzip\s*;\s*q=0(\.0*)?\s*(,|$)", ae)
+
+
+def etag_matches(environ, etag):
+    inm = environ.get("HTTP_IF_NONE_MATCH")
+    if not inm:
+        return False
+    return inm.strip() == "*" or etag in [t.strip()[2:] if t.strip().startswith("W/") else t.strip() for t in inm.split(",")]
+
+
+_file_cache = {}   # file name -> (mtime_ns, size, body, gzipped body, etag)
+
+
+def serve_file(path, content_type, environ=None):
+    """Static page, read from disk once and again only when the file changes; revalidated with an ETag (304)."""
+    environ = environ or {}
     p = HERE / path
-    if not p.is_file():
+    try:
+        st = p.stat()
+    except OSError:
         raise HttpError(404, "not found")
-    body = p.read_bytes()
-    headers = [
-        ("Content-Type", content_type),
-        ("Content-Length", str(len(body))),
-        ("X-Content-Type-Options", "nosniff"),
-        ("Cache-Control", "no-store"),
-    ]
-    return 200, body, headers
+    hit = _file_cache.get(path)
+    if not hit or hit[0] != st.st_mtime_ns or hit[1] != st.st_size:
+        body = p.read_bytes()
+        hit = (st.st_mtime_ns, st.st_size, body, gzip.compress(body, 9, mtime=0), '"f-%s"' % sha(body.decode("utf-8", "replace"))[:16])
+        _file_cache[path] = hit
+    _, _, body, gz, etag = hit
+    cache = [("ETag", etag), ("Cache-Control", "no-cache"), ("Vary", "Accept-Encoding")]
+    if etag_matches(environ, etag):
+        return 304, b"", cache
+    enc = []
+    if accepts_gzip(environ):
+        body, enc = gz, [("Content-Encoding", "gzip")]
+    return 200, body, [("Content-Type", content_type), ("Content-Length", str(len(body))),
+                       ("X-Content-Type-Options", "nosniff")] + enc + cache
 
 
 def client_ip(environ, cfg):
@@ -546,17 +638,58 @@ def conditions_doc(cfg):
     return doc
 
 
+_conditions_cache = (None, None, None)   # (stored config JSON, etag, body)
+
+
 def handle_conditions(cfg, environ):
-    doc = conditions_doc(cfg)
-    etag = '"c-%s"' % doc["version"]
-    if environ.get("HTTP_IF_NONE_MATCH") == etag:
+    global _conditions_cache
+    raw = getattr(cfg, "raw", None)
+    cached = _conditions_cache
+    if raw is not None and cached[0] == raw:
+        _, etag, body = cached
+    else:
+        doc = conditions_doc(cfg)
+        etag = '"c-%s"' % doc["version"]
+        body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
+        if raw is not None:
+            _conditions_cache = (raw, etag, body)
+    if etag_matches(environ, etag):
         return 304, b"", [("ETag", etag)]
-    body = json.dumps(doc, separators=(",", ":")).encode("utf-8")
     return 200, body, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
                        ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", "no-cache")]
 
 
 INVITE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"   # no I, L, O, 0, 1: nothing to mistake when read or typed
+
+
+class MemoryLimiter:
+    """Sliding-window limiter kept in this process (no database write per request). Used for the public, read-only
+    lookup endpoint; with several workers each keeps its own window, so the effective limit is up to workers x limit."""
+    MAX_KEYS = 100000
+
+    def __init__(self):
+        self.lock, self.hits, self.calls = threading.Lock(), {}, 0
+
+    def check(self, who, limit, window=3600):
+        t = time.monotonic()
+        with self.lock:
+            self.calls += 1
+            if self.calls % 2000 == 0 or len(self.hits) > self.MAX_KEYS:
+                for k in [k for k, q in self.hits.items() if not q or q[-1] <= t - window]:
+                    del self.hits[k]
+                if len(self.hits) > self.MAX_KEYS:
+                    self.hits.clear()
+            q = self.hits.get(who)
+            if q is None:
+                q = self.hits[who] = collections.deque()
+            while q and q[0] <= t - window:
+                q.popleft()
+            if len(q) >= limit:
+                raise HttpError(429, "rate limit reached, try again later")
+            q.append(t)
+
+
+_lookup_limiter = MemoryLimiter()
 
 
 def new_invite_code():
@@ -661,7 +794,8 @@ def handle_submit(db, cfg, environ):
     envs = clean_envs(data.get("environments", {}))
     table = latest_table(db)
     refs = table["refs_ms"] if table else None
-    accepted, rejected, touched = 0, [], set()
+    # validate everything first: it only reads the request, so it must not run while the write lock is held
+    valid, rejected = [], []
     for i, e in enumerate(entries):
         norm, why = validate_entry(e, cfg, envs, refs)
         if why:
@@ -669,28 +803,27 @@ def handle_submit(db, cfg, environ):
                 rejected.append({"index": i, "car_id": e.get("car_id") if isinstance(e, dict) else None,
                                  "track": e.get("track") if isinstance(e, dict) else None, "reason": why})
             continue
-        db.execute(
+        valid.append(norm)
+    accepted, touched, status = len(valid), set(), {}
+    if valid:
+        t = now()
+        db.executemany(
             "INSERT INTO submissions(user_id, car_hash, car_id, name, track, score_ms, spread_pct, laps_json, batch, env_id, used, created) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,1,?) ON CONFLICT(user_id, car_hash, track) DO UPDATE SET "
             "car_id=excluded.car_id, name=excluded.name, score_ms=excluded.score_ms, spread_pct=excluded.spread_pct, "
             "laps_json=excluded.laps_json, batch=excluded.batch, env_id=excluded.env_id, created=excluded.created",
-            (user["id"], norm["car_hash"], norm["car_id"], norm["name"], norm["track"], norm["score_ms"],
-             norm["spread_pct"], json.dumps(norm["laps"]), norm["batch"], norm["env_id"], now()))
-        db.execute("INSERT INTO cars(car_hash, car_id, name, updated) VALUES(?,?,?,?) ON CONFLICT(car_hash) DO UPDATE SET "
-                   "car_id=excluded.car_id, name=excluded.name, updated=excluded.updated",
-                   (norm["car_hash"], norm["car_id"], norm["name"], now()))
-        touched.add((norm["car_hash"], norm["track"]))
-        accepted += 1
-    for h, t in touched:
-        recompute(db, cfg, h, t)
-    if touched:
+            [(user["id"], n["car_hash"], n["car_id"], n["name"], n["track"], n["score_ms"], n["spread_pct"],
+              json.dumps(n["laps"]), n["batch"], n["env_id"], t) for n in valid])
+        db.executemany(
+            "INSERT INTO cars(car_hash, car_id, name, updated) VALUES(?,?,?,?) ON CONFLICT(car_hash) DO UPDATE SET "
+            "car_id=excluded.car_id, name=excluded.name, updated=excluded.updated",
+            [(n["car_hash"], n["car_id"], n["name"], t) for n in valid])
+        touched = {(n["car_hash"], n["track"]) for n in valid}
+        for h, tr in touched:
+            key = recompute(db, cfg, h, tr) or "none"
+            status[key] = status.get(key, 0) + 1
         bump(db)
-    db.commit()
-    status = {}
-    for h, t in touched:
-        row = db.execute("SELECT status FROM merged WHERE car_hash=? AND track=?", (h, t)).fetchone()
-        key = row["status"] if row else "none"
-        status[key] = status.get(key, 0) + 1
+        db.commit()
     # the server decides the class: answer with the current record (class, gap, status, flags) of every car just touched
     cars = []
     if touched:
@@ -700,33 +833,55 @@ def handle_submit(db, cfg, environ):
                          "table_version": table["version"] if touched and table else None})
 
 
-_export = {"etag": None, "body": None, "dv": None, "table": None, "built": 0.0}
+_export = None   # (etag, body, gzipped body, data version, table version, built at): replaced as a whole, never edited
 _export_lock = threading.Lock()
 
 
-def _export_fresh(tv, dv, ttl):
-    c = _export
-    return c["body"] is not None and c["table"] == tv and (c["dv"] == dv or time.time() - c["built"] < ttl)
+def _export_fresh(c, tv, dv, ttl):
+    return c is not None and c[4] == tv and (c[3] == dv or time.time() - c[5] < ttl)
+
+
+def _build_export(db, cfg, table, tv, dv):
+    global _export
+    _, cars = car_records(db, cfg)
+    payload = json.dumps({"format": 1, "profile": cfg["profile"], "tracks": cfg["tracks"],
+                          "table": table, "cars": cars}, separators=(",", ":"))
+    # the etag covers the content only (not the timestamp), so it is the same on every worker
+    body = (payload[:-1] + ',"generated":%d}' % now()).encode("utf-8")
+    _export = ('"%d-%s"' % (tv, sha(payload)[:16]), body, gzip.compress(body, 6, mtime=0), dv, tv, time.time())
 
 
 def handle_classes(db, cfg, environ):
     table = latest_table(db)
     tv, dv, ttl = (table["version"] if table else 0), data_version(db), max(0, int(cfg.get("export_max_age", 0)))
-    if not _export_fresh(tv, dv, ttl):
-        with _export_lock:  # one thread rebuilds, the others wait for it instead of all doing the same work
-            if not _export_fresh(tv, dv, ttl):
-                _, cars = car_records(db, cfg)
-                payload = json.dumps({"format": 1, "profile": cfg["profile"], "tracks": cfg["tracks"],
-                                      "table": table, "cars": cars}, separators=(",", ":"))
-                # the etag covers the content only (not the timestamp), so it is the same on every worker
-                body = (payload[:-1] + ',"generated":%d}' % now()).encode("utf-8")
-                _export.update(etag='"%d-%s"' % (tv, sha(payload)[:16]), body=body, dv=dv, table=tv, built=time.time())
-    etag, body = _export["etag"], _export["body"]
+    c = _export
+    if not _export_fresh(c, tv, dv, ttl):
+        # one thread rebuilds. Others keep getting the previous export while it runs (it is at most a rebuild old),
+        # unless it belongs to an older class table or export_max_age is 0 (always fresh): then they wait for it.
+        if _export_lock.acquire(blocking=False):
+            got = True
+        elif c is not None and ttl and c[4] == tv:
+            got = False
+        else:
+            _export_lock.acquire()
+            got = True
+        if got:
+            try:
+                if not _export_fresh(_export, tv, dv, ttl):
+                    _build_export(db, cfg, table, tv, dv)
+            finally:
+                _export_lock.release()
+            c = _export
+    etag, body, gz = c[0], c[1], c[2]
     cache = "public, max-age=%d" % ttl if ttl else "no-cache"
-    if environ.get("HTTP_IF_NONE_MATCH") == etag:
-        return 304, b"", [("ETag", etag), ("Cache-Control", cache)]
+    base = [("ETag", etag), ("Cache-Control", cache), ("Vary", "Accept-Encoding")]
+    if etag_matches(environ, etag):
+        return 304, b"", base
+    enc = []
+    if accepts_gzip(environ):
+        body, enc = gz, [("Content-Encoding", "gzip")]
     return 200, body, [("Content-Type", "application/json"), ("Content-Length", str(len(body))),
-                       ("X-Content-Type-Options", "nosniff"), ("ETag", etag), ("Cache-Control", cache)]
+                       ("X-Content-Type-Options", "nosniff")] + enc + base
 
 
 MAX_LOOKUP = 500
@@ -736,7 +891,7 @@ def handle_lookup(db, cfg, environ):
     """Live data for just the cars a client has installed: POST {"hashes": [car physics hashes]} (public, like
     /v1/classes, but only the requested cars are returned and nothing is cached, so the data is always current).
     Cars the server knows nothing about are simply absent from "cars"."""
-    rate_limit(db, "ip:" + client_ip(environ, cfg), "lookup", cfg["rate_lookups_per_hour"])
+    _lookup_limiter.check("ip:" + client_ip(environ, cfg), cfg["rate_lookups_per_hour"])
     data = read_json(environ, cfg)
     hashes = data.get("hashes")
     if (not isinstance(hashes, list) or not 1 <= len(hashes) <= MAX_LOOKUP
@@ -757,16 +912,17 @@ def _admin_ctx():
 
 
 def route(environ, db_path):
-    db = connect(db_path)
+    method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
+    if method == "GET" and path in ("/", "/stats"):
+        return serve_file("stats.html", "text/html; charset=utf-8", environ)
+    db = request_db(db_path)
     try:
+        if method == "GET" and path == "/v1/health":
+            db.execute("SELECT 1").fetchone()   # health still means "the database answers"
+            return respond(200, {"ok": True, "api": API_VERSION, "time": now()})
         cfg = get_config(db)
-        method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
         if path == "/admin" or path.startswith("/admin/"):
             return admin.handle(environ, db, cfg, _admin_ctx())
-        if method == "GET" and path in ("/", "/stats"):
-            return serve_file("stats.html", "text/html; charset=utf-8")
-        if method == "GET" and path == "/v1/health":
-            return respond(200, {"ok": True, "api": API_VERSION, "time": now()})
         if method == "GET" and path == "/v1/conditions":
             return handle_conditions(cfg, environ)
         if method == "GET" and path == "/v1/config":
@@ -791,7 +947,8 @@ def route(environ, db_path):
             return respond(200, {"car": cars[0], "table_version": table["version"] if table else None})
         raise HttpError(404, "not found")
     finally:
-        db.close()
+        if db.in_transaction:   # a failed request must not leave a transaction (and its write lock) open on a reused connection
+            db.rollback()
 
 
 def create_app(db_path):
@@ -937,11 +1094,9 @@ def cmd_admin(args):
         if not row:
             raise SystemExit("no such user")
         db.execute("UPDATE users SET banned=? WHERE id=?", (1 if c == "ban" else 0, row["id"]))
-        db.commit()
         keys = db.execute("SELECT DISTINCT car_hash, track FROM submissions WHERE user_id=?", (row["id"],)).fetchall()
         for k in keys:
             recompute(db, cfg, k["car_hash"], k["track"])
-        db.commit()
         bump(db)
         db.commit()
         print("%s: %s, %d merged entries recomputed" % (c, args.name, len(keys)))
