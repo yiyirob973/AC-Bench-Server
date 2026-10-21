@@ -1,6 +1,6 @@
 # AC Bench Server
 
-The cloud backend for AC Bench. It validates benchmark submissions, recomputes lap scores, merges community results, and publishes versioned class tables for the desktop app.
+The cloud backend for AC Bench. It validates benchmark submissions, recomputes lap scores, merges community results, and keeps a live class table that tells the desktop app which class each car is in.
 
 ## For most users
 
@@ -15,7 +15,9 @@ Once the server is running, the public dashboard is available here:
 - `http://<server-host>/`
 - `http://<server-host>/stats`
 
-The dashboard is a static HTML page served from the server root and is intended for operator-facing monitoring.
+The page lists the cars that were added most recently first, with a tab for all cars, class filters, search and a CSV
+download. It reads `/v1/classes` from the same server. To point a copy of the page at another server, open it with
+`?server=https://other-host` (that server then has to allow cross-origin reads).
 
 The JSON API remains under:
 
@@ -30,7 +32,7 @@ The JSON API remains under:
 - Verifies the benchmark environment against a canonical tracked reference
 - Recomputes lap scores on the server instead of trusting the client
 - Merges submissions from multiple users into one agreed result per car and track
-- Publishes versioned class tables for the desktop app to consume
+- Keeps a live class table, rebuilt from the merged times, for the desktop app to consume
 - Stores database backups and server configuration for operator maintenance
 
 ## Workflow
@@ -39,7 +41,7 @@ The JSON API remains under:
 2. The desktop app uploads results to this server with a valid API key
 3. The server validates the submission against the canonical environment
 4. The server recomputes scores and merges data from multiple users
-5. The server publishes a versioned class table
+5. The class table follows the merged times by itself, and the answer to the upload says which class each car is in
 6. Users download the table and see cars assigned to classes
 
 ## Server responsibilities in detail
@@ -94,17 +96,30 @@ Status outcomes:
 - `provisional`: only one user has uploaded data so far
 - `disputed`: submissions disagree and are not treated as definitive yet
 
-### Class tables
+### Time table and class table
 
-Class tables are versioned and published by the operator.
+The two are kept apart:
 
-A published table includes:
-- reference times per track
-- cut points between classes
-- class labels and distribution data
-- metadata for variance and borderline flags
+- The **time table** (`merged`) holds one agreed lap time per car and track, plus the log of that time. Nothing is
+  stored per car beyond that: a car's rating is worked out from its own lap times whenever it is needed (the mean of
+  ln(lap time) over the benchmark tracks), so an upload only touches the cars it is about.
+- The **class table** is a single live row: the cut points between classes on that rating scale, the class labels and
+  each class's average lap time per track (used for the balance hints). It also holds the score of the fastest rated
+  car. Every upload checks whether one of its cars beats that score and lowers it if so.
 
-The desktop app downloads the latest version. Class membership remains fixed to the table version at publish time, rather than moving silently as more data arrives.
+The class table is rebuilt from the time table by a background job shortly after results change (at most every
+`class_refresh_seconds`, default 10). The database averages each car's lap times and counts the cars into small score
+buckets with grouped queries, and the border search runs on those buckets, so the search takes the same time for 5,000
+cars as for 100,000. Reading the lap rows still grows with the number of cars, though only at database speed (roughly
+0.1 s at 5,000 cars and 0.6 s at 100,000 in tests). Borders are found to within 1/20 of a class width.
+
+Asking for a car's class is a lookup of its rating among the cut points, so it costs the same whatever the number of
+cars, and an upload answers with the class straight away. The numbers shown (`gap_pct`, which `score_pct` repeats, and
+the per-track `deltas`) are measured from the fastest rated car and the fastest laps right now, so the fastest car is
+at 0% the moment it is uploaded and nothing is ever negative. If the fastest car is later banned or disputed, the
+numbers stay slightly high until the next rebuild sets the fastest score again. When a faster car arrives the class
+borders move at the next rebuild; the class table's `version` goes up only when its borders or labels actually change,
+so a client can compare it to know whether classes may have moved.
 
 ## Operational model
 
@@ -126,7 +141,7 @@ This keeps the server auditable and easy to run without a large infrastructure s
   unchanged requests cost almost nothing. `/v1/classes` and `/stats` are gzip-compressed (`Accept-Encoding: gzip`)
   and support `If-None-Match` (strong or weak ETags).
 - While one thread rebuilds the `/v1/classes` export, other requests are served the previous export (at most one
-  rebuild old); with `export_max_age` 0 or after a new class table is published they wait for the fresh one.
+  rebuild old); with `export_max_age` 0 or when the class table was just rebuilt they wait for the fresh one.
 - Uploads are validated before the database write lock is taken, then written in one short transaction.
 - Scale with the compose/Docker environment: `WEB_CONCURRENCY` (worker processes, default 2) and
   `GUNICORN_CMD_ARGS` (default `--worker-class gthread --threads 8 ...`). Roughly one worker per CPU core.
@@ -196,7 +211,7 @@ All CLI entry points are:
 - `unban NAME`
 - `backup --to PATH`
 - `recompute-all`
-- `publish-classes [--include-provisional]`
+- `recalc-classes` (rebuild the class table right now; the server also does it by itself)
 - `stats`
 - `disputed`
 - `config get`
@@ -209,7 +224,7 @@ python server.py init
 python server.py set-env --from track_check_log.json
 python server.py invite --role user --uses 20
 python server.py serve --port 8080
-python server.py publish-classes
+python server.py recalc-classes
 ```
 
 ## API
@@ -218,13 +233,13 @@ The server exposes a small JSON API.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Static stats dashboard |
-| `GET` | `/stats` | Static stats dashboard |
+| `GET` | `/` | Stats page |
+| `GET` | `/stats` | Stats page |
 | `GET` | `/v1/health` | Liveness check |
 | `GET` | `/v1/config` | Accepted profile, limits, canonical environment, version info |
 | `POST` | `/v1/register` | Register with an invite code |
 | `POST` | `/v1/submit` | Upload benchmark results using a bearer token |
-| `GET` | `/v1/classes` | Download the published class table and car data |
+| `GET` | `/v1/classes` | Download the live class table and car data (each car has `added`, when it first appeared, and `updated`) |
 | `GET` | `/v1/cars/<car_hash>` | Fetch a single car record |
 
 Upload payloads include:
@@ -241,7 +256,7 @@ The server stores:
 - hashed API keys
 - uploaded results
 - rate-limit events
-- versioned class tables
+- the live class table
 
 Rate-limit events are short-lived and are purged after a period of time.
 
@@ -272,11 +287,11 @@ Everything sits at the root of the repository, and the server needs nothing beyo
 
 ## Relationship to the desktop app
 
-The desktop app remains the main user-facing tool for benchmark runs and car analysis. This repo is the backend service that validates submissions, merges them, and publishes class tables.
+The desktop app remains the main user-facing tool for benchmark runs and car analysis. This repo is the backend service that validates submissions, merges them, and keeps the class table.
 
 ## Summary
 
-AC Bench Server is the validation and publication backend for the AC Bench ecosystem. It gives the desktop app a trustworthy way to share benchmark results, reconcile competing submissions, and publish shared class data across a community without exposing the project to anonymous or untrusted uploads.
+AC Bench Server is the validation and sharing backend for the AC Bench ecosystem. It gives the desktop app a trustworthy way to share benchmark results, reconcile competing submissions, and keep shared class data for a community without exposing the project to anonymous or untrusted uploads.
 
 For most users, start with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop).
 
@@ -294,8 +309,7 @@ limit can reach N x that).
 
 Classes are named `1A` (top class), `1B` ... `1Z`, then `2A` ... `2Z`, `3A` ... Two-letter codes such as `AA` are no
 longer used: searching for class "A" matched cars in other classes. Tags are `#Pride-1A`, `#Pride-1B`, ... and applying
-tags replaces any older `#Pride-` tag (for example `#Pride-A`). The server renames the classes of already published
-tables the same way, so no migration is needed.
+tags replaces any older `#Pride-` tag (for example `#Pride-A`). The live class table always uses these names.
 
 
 ## Submit response
