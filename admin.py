@@ -48,6 +48,7 @@ EDITABLE = {
     "spread_limit_pct": (float, 0.1, 10), "export_max_age": (int, 0, 3600),
     "rate_submits_per_hour": (int, 1, 10000), "rate_register_per_hour": (int, 1, 10000), "rate_lookups_per_hour": (int, 1, 100000),
     "class_gap": (float, 0.1, 20), "min_class_size": (int, 1, 100), "tie_zone": (float, 0, 5),
+    "variance_limit_pct": (float, 0.1, 100),
 }
 
 

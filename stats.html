@@ -290,7 +290,7 @@ function detailRow(r, span) {
     if (r.n[t] !== null) parts.push(r.n[t] + " matching submission" + (r.n[t] === 1 ? "" : "s"));
     item(t, parts.join(", "));
   }
-  if (r.variance !== null) item("Difference between tracks", fmtPct(r.variance));
+  if (r.variance !== null) item("Balance compared with its class", fmtPct(r.variance));
   if (r.bop) item("Balance hint", r.bop);
   if (r.added) item("First added", fmtStamp(r.added));
   if (r.updated) item("Last updated", fmtStamp(r.updated));

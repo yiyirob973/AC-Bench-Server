@@ -121,6 +121,21 @@ numbers stay slightly high until the next rebuild sets the fastest score again. 
 borders move at the next rebuild; the class table's `version` goes up only when its borders or labels actually change,
 so a client can compare it to know whether classes may have moved.
 
+### Flags on a car
+
+A car's record can carry flags, shown on the stats page and returned in `flags`:
+
+- **borderline 1B/1C (0.07%)**: the car sits within `tie_zone` percent of a class border, so a small change could move it.
+- **high variance (12.9%)**: the car's balance between tracks is unusual for its class. For each track the server takes the
+  car's lap time against the class's average lap time on that track, then looks at how far apart those comparisons are.
+  A slow car that is slow in the usual way for its class scores about 0 however far behind the fastest car it is, so the
+  flag does not just mark slow cars. The limit is the `variance_limit_pct` setting (default 3). The value is returned as
+  `variance_pct`. A class with only one or two cars has little to compare against, so the flag is weak there.
+
+Both flags are advice for balancing a grid. They do not change whether a car is verified: that depends only on
+`tolerance_pct` and `min_confirmations`. Changing `variance_limit_pct` takes effect at the next class table rebuild
+(within `class_refresh_seconds`) and does not change the class table's `version`.
+
 ## Operational model
 
 The server is intentionally simple and conservative:

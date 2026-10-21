@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "trust_proxy_header": False,        # honour X-Forwarded-For (only behind your own proxy)
     "class_gap": 2.0, "min_class_size": 3, "tie_zone": 0.10,  # class table settings (see ac_rating.py)
     "include_provisional": False,       # cut the classes from provisional results too, not only verified ones
+    "variance_limit_pct": 3.0,          # flag a car whose balance between tracks differs this much from its class's usual balance
     "class_refresh_seconds": 10,        # the class borders are recalculated at most this often while results come in
     "env": None,                        # canonical {"tracks": {track: digest}, "acs": sha256}
     "conditions": {},                   # free-form benchmark conditions served to clients (weather, time, ...)
@@ -495,20 +496,23 @@ def classify(table, times_ms, live):
     base = live["base"] if live["base"] is not None else score
     gap = max(0.0, math.expm1(score - base) * 100)
     deltas = {t: max(0.0, (times_ms[t] / live["refs"].get(t, times_ms[t]) - 1) * 100) for t in tracks}
-    variance = max(deltas.values()) - min(deltas.values())
+    # balance: how this car's lap times sit on each track compared with its class's average, with the overall level
+    # taken out. A slow car that is slow in the usual way for its class has a balance of 0 however far behind it is.
+    norms = table["norms"].get(label, {})
+    off = [math.log(times_ms[t]) - norms[t] for t in tracks if t in norms]       # > 0: slower here than the class usually is
+    variance = math.expm1(max(off) - min(off)) * 100 if len(off) == len(tracks) else 0.0
     flags, bop = [], ""
     if cuts:
         k = _nearest_cut(cuts, score)
         dist = math.expm1(abs(cuts[k] - score)) * 100
         if dist < table["tie_zone"]:
             flags.append("borderline %s/%s (%.2f%%)" % (_label(k + 1), _label(k + 2), dist))
-    if variance > table["class_gap"]:
+    if variance > table.get("variance_limit", table["class_gap"]):
         flags.append("high variance (%.1f%%)" % variance)
     bits = []
     for t in tracks:
-        norm = table["norms"].get(label, {}).get(t)       # the class's average ln lap time on this track
-        if norm is not None:
-            faster = norm - math.log(times_ms[t])          # > 0: this car is quicker here than its class usually is
+        if t in norms:
+            faster = -(math.log(times_ms[t]) - norms[t])   # > 0: this car is quicker here than its class usually is
             if faster * 100 > 0.25 * table["class_gap"]:
                 bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], math.expm1(faster) * 100))
     bop = "; ".join(bits)
@@ -521,7 +525,7 @@ _class_wake = threading.Event()   # set whenever results change; wakes this proc
 
 def _class_params(cfg):
     return json.dumps([CLASS_FORMAT, cfg["profile"], cfg["tracks"], cfg["class_gap"], cfg["min_class_size"], cfg["tie_zone"],
-                       bool(cfg["include_provisional"])])
+                       bool(cfg["include_provisional"]), cfg["variance_limit_pct"]])
 
 
 def class_table_stale(db, cfg):
@@ -583,7 +587,8 @@ def build_class_table(db, cfg):
         if v is not None:
             refs[t] = v
     body = {"format": CLASS_FORMAT, "profile": cfg["profile"], "tracks": tracks, "refs_ms": refs, "cuts": cuts, "labels": labels,
-            "norms": norms, "class_gap": cfg["class_gap"], "tie_zone": cfg["tie_zone"], "n_cars": n, "classes": summary,
+            "norms": norms, "class_gap": cfg["class_gap"], "tie_zone": cfg["tie_zone"], "variance_limit": cfg["variance_limit_pct"],
+            "n_cars": n, "classes": summary,
             "include_provisional": bool(cfg["include_provisional"])}
     return body, best
 
