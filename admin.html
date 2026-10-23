@@ -4,27 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AC Bench admin</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style nonce="{{NONCE}}">
-:root{color-scheme:dark;--bg:#14171c;--card:#1d2129;--line:#2c323d;--fg:#e6e8eb;--mut:#8b93a1;--acc:#7fb2ff;--bad:#ff7b72;--ok:#56d364;--warn:#e3b341}
+:root{color-scheme:dark;--bg:#0c1627;--card:#111d33;--line:#234259;--field:#182a45;--fg:#e8f1f8;--mut:#9fb3c8;--acc:#97e7f2;--bad:#ef6f6f;--ok:#5fd3a0;--warn:#f2c46d}
 *{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
 header{display:flex;gap:1rem;align-items:center;justify-content:space-between;padding:.8rem 1.2rem;border-bottom:1px solid var(--line)}
-h1{font-size:1.05rem;margin:0}h2{font-size:.95rem;margin:0 0 .6rem;color:var(--acc)}
+h1{font-size:1.05rem;margin:0;display:flex;align-items:center;gap:.6rem}h1 img{width:28px;height:28px}h2{font-size:.95rem;margin:0 0 .6rem;color:var(--acc)}
 main{max-width:1100px;margin:0 auto;padding:1rem;display:grid;gap:1rem}
 section{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:1rem;overflow-x:auto}
 table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:.35rem .5rem;border-bottom:1px solid var(--line);white-space:nowrap}
 th{color:var(--mut);font-weight:500}
-button,input,select,textarea{font:inherit;color:var(--fg);background:#262b35;border:1px solid var(--line);border-radius:6px;padding:.3rem .6rem}
+button,input,select,textarea{font:inherit;color:var(--fg);background:var(--field);border:1px solid var(--line);border-radius:6px;padding:.3rem .6rem}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.danger:hover{border-color:var(--bad)}
-.stats{display:flex;flex-wrap:wrap;gap:.6rem}.stat{background:#262b35;border-radius:6px;padding:.5rem .8rem;min-width:7rem}
+.stats{display:flex;flex-wrap:wrap;gap:.6rem}.stat{background:var(--field);border-radius:6px;padding:.5rem .8rem;min-width:7rem}
 .stat b{display:block;font-size:1.3rem}.stat span,.mut{color:var(--mut)}
 .row{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;margin-bottom:.6rem}
-.tag{padding:.05rem .4rem;border-radius:4px;background:#262b35}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
-#toast{position:fixed;right:1rem;bottom:1rem;max-width:24rem;background:#262b35;border:1px solid var(--line);border-radius:8px;padding:.7rem 1rem;display:none}
+.tag{padding:.05rem .4rem;border-radius:4px;background:var(--field)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+#toast{position:fixed;right:1rem;bottom:1rem;max-width:24rem;background:var(--field);border:1px solid var(--line);border-radius:8px;padding:.7rem 1rem;display:none}
 #toast.show{display:block}code{user-select:all;color:var(--ok)}.wide{width:100%;font-family:ui-monospace,monospace}.w5{width:5rem}.w7{width:7rem}
 </style>
 </head>
 <body>
-<header><h1>AC Bench admin</h1><div class="row"><span class="mut" id="me"></span><button id="logout">Sign out</button></div></header>
+<header><h1><img src="/logo.png" width="28" height="28" alt="">AC Bench admin</h1><div class="row"><span class="mut" id="me"></span><button id="logout">Sign out</button></div></header>
 <main id="main"><section>Loading…</section></main>
 <div id="toast"></div>
 <script nonce="{{NONCE}}">

@@ -1,4 +1,14 @@
-# AC Bench Server
+<p align="center">
+  <img src="branding/ac-bench.png" alt="AC Bench logo" width="140">
+</p>
+
+<h1 align="center">AC Bench Server</h1>
+
+<p align="center">
+  The shared class list for AC Bench: collects benchmark results, checks them and tells the app which class each car is in.
+</p>
+
+---
 
 AC Bench sorts Assetto Corsa cars into classes by how fast they are on a standard benchmark, so you can put together grids where the cars are evenly matched. People run the benchmark on their own PC with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop) and upload the results. This server collects those results, checks them, combines them, and tells the app which class each car belongs to.
 
@@ -14,7 +24,7 @@ This repository is for people who run a server of their own, for example a commu
 - Checks every upload and works out the lap scores itself instead of trusting the app
 - Compares results from different people and settles on one result per car and track
 - Keeps a class table that updates as new results come in, and answers the app's questions about which class a car is in
-- Serves a public page with the full list of cars and their classes
+- Serves a public page with the full list of cars and their classes, in the AC Bench colors
 - Gives the operator an admin dashboard and a few command line tools
 
 ## How a result becomes a class
@@ -202,6 +212,7 @@ admin.py             the admin dashboard's sign-in and actions
 admin.html           the admin dashboard page
 ac_rating.py         splits cars into classes and names them
 stats.html           the public cars page
+branding/            the logo: favicon.ico and logo.png are served by the server, ac-bench.png is for this README
 Dockerfile
 docker-compose.yml
 backup.sh            database backup, meant to run from cron

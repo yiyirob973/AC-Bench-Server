@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 WORKDIR /app
 COPY ac_rating.py server.py admin.py admin.html stats.html backup.sh /app/
+COPY branding/favicon.ico branding/logo.png /app/branding/
 RUN pip install --no-cache-dir gunicorn \
     && useradd --create-home acb && mkdir /data && chown acb /data
 ENV ACB_DB=/data/acbench.db

@@ -125,13 +125,13 @@ SEC_HEADERS = [("X-Content-Type-Options", "nosniff"), ("Cache-Control", "no-stor
 
 def _message_page(code, title, msg, link=("/admin", "Back to /admin")):
     body = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><body style=\"font:16px system-ui;background:#14171c;color:#e6e8eb;display:grid;"
+            "<title>%s</title><link rel=icon href=/favicon.ico><body style=\"font:16px system-ui;background:#0c1627;color:#e8f1f8;display:grid;"
             "place-items:center;height:100vh;margin:0\"><div style=\"max-width:28rem;padding:1.5rem\"><h1 style="
-            "\"font-size:1.2rem\">%s</h1><p>%s</p><p><a style=\"color:#7fb2ff\" href=\"%s\">%s</a></p>"
+            "\"font-size:1.2rem\">%s</h1><p>%s</p><p><a style=\"color:#97e7f2\" href=\"%s\">%s</a></p>"
             "</div>" % (html.escape(title), html.escape(title), html.escape(msg),
                         html.escape(link[0]), html.escape(link[1]))).encode("utf-8")
     return code, body, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
-                        ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")] + SEC_HEADERS
+                        ("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'")] + SEC_HEADERS
 
 
 # ------------------------------------------------------------------ OIDC (PocketID)
@@ -526,7 +526,7 @@ def api(db, cfg, ctx, sess, environ, method, path, now):
 def dashboard():
     nonce = secrets.token_urlsafe(16)
     body = (HERE / "admin.html").read_text(encoding="utf-8").replace("{{NONCE}}", nonce).encode("utf-8")
-    csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; connect-src 'self'; "
+    csp = ("default-src 'none'; script-src 'nonce-%s'; style-src 'nonce-%s'; connect-src 'self'; img-src 'self'; "
            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'" % (nonce, nonce))
     return 200, body, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body))),
                        ("Content-Security-Policy", csp)] + SEC_HEADERS
