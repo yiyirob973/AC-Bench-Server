@@ -13,7 +13,7 @@ Run
   python server.py serve --port 8080                      small deployments; production: gunicorn server:application
 
 Operate
-  python server.py publish-classes                        cut a new class table from the verified data
+  python server.py recalc-classes                         rebuild the class table now (the server also does it by itself)
   python server.py stats | disputed | ban NAME | unban NAME | config get|set KEY VALUE | recompute-all
   python server.py set-role NAME --role trusted|user      a trusted user's submissions verify on their own
   python server.py backup --to /data/backups/acbench-2026-01-01.db    consistent copy while running
@@ -43,8 +43,8 @@ What the server does with it
   - agreement: submissions within tolerance_pct of each other confirm one another. 2+ agreeing
     users (or one trusted user) = verified; a single user = provisional; users that disagree =
     disputed (not used until more data arrives)
-  - classes come from a versioned class table: reference times + cut points fixed at publish time,
-    so a car's class does not move when other cars are added. Publish a new table deliberately.
+  - classes come from one live class table (reference times = the fastest car per track, plus cut points),
+    rebuilt in the background from the merged times. A car's class is a lookup in it, so it can move as the field grows.
 """
 
 import argparse, bisect, collections, functools, gzip, hashlib, json, math, os, re, secrets, sqlite3, statistics, sys, threading, time
@@ -75,6 +75,9 @@ DEFAULT_CONFIG = {
     "rate_submits_per_hour": 20, "rate_register_per_hour": 10, "rate_lookups_per_hour": 240,
     "trust_proxy_header": False,        # honour X-Forwarded-For (only behind your own proxy)
     "class_gap": 2.0, "min_class_size": 3, "tie_zone": 0.10,  # class table settings (see ac_rating.py)
+    "include_provisional": False,       # cut the classes from provisional results too, not only verified ones
+    "variance_limit_pct": 3.0,          # flag a car whose balance between tracks differs this much from its class's usual balance
+    "class_refresh_seconds": 10,        # the class borders are recalculated at most this often while results come in
     "env": None,                        # canonical {"tracks": {track: digest}, "acs": sha256}
     "conditions": {},                   # free-form benchmark conditions served to clients (weather, time, ...)
     "export_max_age": 30,               # seconds the /v1/classes export may lag behind new uploads (0 = always fresh)
@@ -101,13 +104,16 @@ CREATE TABLE IF NOT EXISTS submissions (
 CREATE INDEX IF NOT EXISTS sub_key ON submissions (car_hash, track);
 CREATE TABLE IF NOT EXISTS merged (
   car_hash TEXT NOT NULL, track TEXT NOT NULL, score_ms REAL NOT NULL, n_used INTEGER NOT NULL,
-  n_total INTEGER NOT NULL, spread_pct REAL NOT NULL, status TEXT NOT NULL, updated INTEGER NOT NULL,
+  n_total INTEGER NOT NULL, spread_pct REAL NOT NULL, status TEXT NOT NULL, updated INTEGER NOT NULL, ln_ms REAL,
   PRIMARY KEY (car_hash, track));
 CREATE TABLE IF NOT EXISTS cars (
-  car_hash TEXT PRIMARY KEY, car_id TEXT NOT NULL, name TEXT NOT NULL, updated INTEGER NOT NULL);
+  car_hash TEXT PRIMARY KEY, car_id TEXT NOT NULL, name TEXT NOT NULL, updated INTEGER NOT NULL, added INTEGER);
 CREATE INDEX IF NOT EXISTS users_created ON users (created, id);
 CREATE INDEX IF NOT EXISTS merged_status ON merged (status, updated);
-CREATE TABLE IF NOT EXISTS class_tables (version INTEGER PRIMARY KEY, created INTEGER NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS class_table (        -- the one live class table, rebuilt from merged (the time table) as results change
+  id INTEGER PRIMARY KEY CHECK (id = 1), rev INTEGER NOT NULL, version INTEGER NOT NULL, built INTEGER NOT NULL,
+  dv INTEGER NOT NULL, params TEXT NOT NULL, body TEXT NOT NULL,
+  best REAL);   -- score of the fastest rated car: lowered by uploads that beat it, set exactly at every rebuild
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, who TEXT NOT NULL, kind TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS ev_idx ON events (who, kind, ts);
 CREATE INDEX IF NOT EXISTS ev_ts ON events (ts);
@@ -163,11 +169,35 @@ def request_db(path):
 def init_db(path):
     db = connect(path)
     db.executescript(SCHEMA + admin.SCHEMA)
+    db.execute("BEGIN IMMEDIATE")   # workers starting together take turns here, and the second finds the work done
     if db.execute("SELECT 1 FROM cars LIMIT 1").fetchone() is None and db.execute("SELECT 1 FROM submissions LIMIT 1").fetchone():
         # existing database from before the cars table: take each car's most recent submission's names (one-time scan)
         db.execute("INSERT OR IGNORE INTO cars(car_hash, car_id, name, updated) "
                    "SELECT car_hash, car_id, name, MAX(created) FROM submissions GROUP BY car_hash")
+    if db.execute("SELECT 1 FROM class_table").fetchone() is None and \
+            db.execute("SELECT 1 FROM sqlite_master WHERE name='class_tables'").fetchone():
+        # database from the time of published class tables: the newest one becomes the live table, then it is rebuilt
+        old = db.execute("SELECT version, created, body FROM class_tables ORDER BY version DESC LIMIT 1").fetchone()
+        if old:
+            body = json.loads(old["body"])
+            body["labels"] = [class_label(i + 1) for i in range(len(body.get("labels", [])))]
+            db.execute("INSERT OR IGNORE INTO class_table(id, rev, version, built, dv, params, body) VALUES(1, 1, ?, ?, -1, '', ?)",
+                       (old["version"], old["created"], json.dumps(body)))
+    if "ln_ms" not in {c["name"] for c in db.execute("PRAGMA table_info(merged)")}:
+        db.execute("ALTER TABLE merged ADD COLUMN ln_ms REAL")
+    if "best" not in {c["name"] for c in db.execute("PRAGMA table_info(class_table)")}:
+        db.execute("ALTER TABLE class_table ADD COLUMN best REAL")
+    db.execute("CREATE INDEX IF NOT EXISTS merged_track_best ON merged (track, status, score_ms)")
+    if not any(c["name"] == "added" for c in db.execute("PRAGMA table_info(cars)")):
+        db.execute("ALTER TABLE cars ADD COLUMN added INTEGER")     # databases from before "new cars" was tracked
+    # when a car first showed up: the earliest submission we still have for it, else its last update
+    db.execute("UPDATE cars SET added=COALESCE((SELECT MIN(created) FROM submissions s WHERE s.car_hash=cars.car_hash), updated) "
+               "WHERE added IS NULL")
     db.commit()
+    todo = db.execute("SELECT car_hash, track, score_ms FROM merged WHERE ln_ms IS NULL").fetchall()
+    if todo:   # an upgraded database: the log of every lap time is worked out once, before any request
+        db.executemany("UPDATE merged SET ln_ms=? WHERE car_hash=? AND track=?", [(math.log(r["score_ms"]), r["car_hash"], r["track"]) for r in todo])
+        db.commit()
     return db
 
 
@@ -194,6 +224,7 @@ def set_config(db, cfg):
 def bump(db):
     """Data version counter: changes whenever merged data or class tables change (drives ETag and cache)."""
     db.execute("INSERT INTO meta(k, v) VALUES('dv', '1') ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1")
+    _class_wake.set()
 
 
 def data_version(db):
@@ -201,25 +232,34 @@ def data_version(db):
     return int(row["v"]) if row else 0
 
 
-_table_cache = {}   # database path -> (version, parsed table); tables are immutable once published
+CLASS_FORMAT = 3   # 3: borders and class averages are on the mean-ln-lap-time scale (see car_score); nothing is stored per car
+
+
+class Table(dict):
+    rev = 0     # grows each time the stored row is rewritten; the body can change without a new version
+
+
+_table_cache = {}   # database path -> (rev, parsed table)
 
 
 def latest_table(db):
-    """The newest class table. The returned dict is shared between requests: treat it as read-only."""
-    top = db.execute("SELECT MAX(version) AS v FROM class_tables").fetchone()["v"]
-    if top is None:
+    """The live class table, or None before there are enough rated cars. The returned dict is shared between
+    requests: treat it as read-only."""
+    row = db.execute("SELECT rev FROM class_table WHERE id=1").fetchone()
+    if row is None:
         return None
     hit = _table_cache.get(db.path)
-    if hit and hit[0] == top:
+    if hit and hit[0] == row["rev"]:
         return hit[1]
-    row = db.execute("SELECT version, created, body FROM class_tables WHERE version=?", (top,)).fetchone()
-    if not row:
+    row = db.execute("SELECT rev, body FROM class_table WHERE id=1").fetchone()
+    if row is None:
         return None
-    body = json.loads(row["body"])
-    # tables published before the 1A..1Z, 2A.. scheme stored letter labels (A, B, ... AA): same classes, new names
-    body["labels"] = [class_label(i + 1) for i in range(len(body.get("labels", [])))]
-    _table_cache[db.path] = (top, body)
-    return body
+    table = Table(json.loads(row["body"]))
+    table.rev = row["rev"]
+    if table.get("format") != CLASS_FORMAT:   # a table from before the ratings were stored per car: rebuilt on start
+        table = None
+    _table_cache[db.path] = (row["rev"], table)
+    return table
 
 
 def clean_text(s):
@@ -324,6 +364,32 @@ def validate_entry(e, cfg, envs, refs):
 
 # ------------------------------------------------------------------ merge
 
+def car_score(times_ms, tracks):
+    """A car's rating on one scale: the mean of ln(lap time) over the benchmark tracks. Nothing is stored for it:
+    it is worked out from the car's own times whenever it is needed, and only differences between cars matter."""
+    return sum(math.log(times_ms[t]) for t in tracks) / len(tracks)
+
+
+def note_fastest(db, cfg, car_hashes):
+    """The "is it the fastest" check of an upload: if any of these cars is rated and beats the stored fastest score,
+    that score is lowered. (A rebuild of the class table sets it exactly again, so it can't stay wrong for long.)"""
+    tracks = cfg["tracks"]
+    hashes = sorted(set(car_hashes))
+    per = {}
+    for i in range(0, len(hashes), 500):
+        part = hashes[i:i + 500]
+        for r in db.execute("SELECT car_hash, track, score_ms, status FROM merged WHERE car_hash IN (%s)" % ",".join("?" * len(part)), part):
+            per.setdefault(r["car_hash"], []).append((r["track"], r["score_ms"], r["status"]))
+    best = None
+    for rows in per.values():
+        have = {t: ms for t, ms, _ in rows}
+        if car_status([st for _, _, st in rows], have, tracks) in ("verified", "provisional"):
+            sc = car_score(have, tracks)
+            best = sc if best is None or sc < best else best
+    if best is not None:
+        db.execute("UPDATE class_table SET best=? WHERE id=1 AND (best IS NULL OR best > ?)", (best, best))
+
+
 def recompute(db, cfg, car_hash, track):
     """Agreement between users for one car on one track. Updates submissions.used and merged; returns the new
     merged status (None when the car has no submissions left).
@@ -366,120 +432,261 @@ def recompute(db, cfg, car_hash, track):
     else:
         status = "disputed"
     cl_scores = [r["score_ms"] for r in cluster]
-    spread = (max(cl_scores) - min(cl_scores)) / statistics.median(cl_scores) * 100
+    median = statistics.median(cl_scores)
+    spread = (max(cl_scores) - min(cl_scores)) / median * 100
     changed = [(1 if r["id"] in used else 0, r["id"]) for r in rows if r["used"] != (1 if r["id"] in used else 0)]
     if changed:
         db.executemany("UPDATE submissions SET used=? WHERE id=?", changed)
     db.execute(
-        "INSERT INTO merged(car_hash, track, score_ms, n_used, n_total, spread_pct, status, updated) "
-        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(car_hash, track) DO UPDATE SET score_ms=excluded.score_ms, "
+        "INSERT INTO merged(car_hash, track, score_ms, n_used, n_total, spread_pct, status, updated, ln_ms) "
+        "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(car_hash, track) DO UPDATE SET score_ms=excluded.score_ms, "
         "n_used=excluded.n_used, n_total=excluded.n_total, spread_pct=excluded.spread_pct, "
-        "status=excluded.status, updated=excluded.updated",
-        (car_hash, track, statistics.median(cl_scores), len(cluster), len(rows), spread, status, now()))
+        "status=excluded.status, updated=excluded.updated, ln_ms=excluded.ln_ms",
+        (car_hash, track, median, len(cluster), len(rows), spread, status, now(), math.log(median)))
     return status
 
 
 # ------------------------------------------------------------------ classes
 
 _label = functools.lru_cache(maxsize=None)(class_label)
-_cut_slot = (None, None)   # (cuts list, its log1p values): recomputed only when the class table changes
 
 
-def _cut_logs(cuts):
-    global _cut_slot
-    slot = _cut_slot
-    if slot[0] is cuts:
-        return slot[1]
-    logs = [math.log1p(c / 100) for c in cuts]
-    _cut_slot = (cuts, logs)
-    return logs
-
-
-def _nearest_cut(logs, y):
-    """Index of the cut closest to y in log space (the first one on an exact tie), by bisection: the cuts are sorted."""
-    i = bisect.bisect_left(logs, y)
+def _nearest_cut(cuts, y):
+    """Index of the cut closest to y (the first one on an exact tie), by bisection: the cuts are sorted."""
+    i = bisect.bisect_left(cuts, y)
     if i == 0:
         k = 0
-    elif i == len(logs):
-        k = len(logs) - 1
+    elif i == len(cuts):
+        k = len(cuts) - 1
     else:
-        k = i - 1 if abs(logs[i - 1] - y) <= abs(logs[i] - y) else i
-    while k > 0 and logs[k - 1] == logs[k]:
+        k = i - 1 if abs(cuts[i - 1] - y) <= abs(cuts[i] - y) else i
+    while k > 0 and cuts[k - 1] == cuts[k]:
         k -= 1
     return k
 
 
-def classify(table, times_ms):
-    """times_ms: {track: score_ms}. Class, gap and flags from the fixed class table."""
+_live_cache = {}   # database path -> (data version, tracks, live reference)
+
+
+def live_reference(db, tracks):
+    """What the ratings are measured against right now: the fastest rated car's score (kept by the class table, lowered
+    by uploads) and the fastest lap per track (one index lookup each)."""
+    dv = data_version(db)
+    hit = _live_cache.get(db.path)
+    if hit and hit[0] == dv and hit[1] == tracks:
+        return hit[2]
+    row = db.execute("SELECT best FROM class_table WHERE id=1").fetchone()
+    refs = {}
+    for t in tracks:
+        v = db.execute("SELECT MIN(score_ms) FROM merged WHERE track=? AND status IN ('verified','provisional')", (t,)).fetchone()[0]
+        if v is not None:
+            refs[t] = v
+    live = {"base": row["best"] if row else None, "refs": refs}
+    _live_cache[db.path] = (dv, list(tracks), live)
+    return live
+
+
+def classify(table, times_ms, live):
+    """times_ms: {track: score_ms}. The class is a lookup of the car's score among the class table's borders; the
+    numbers shown (gap, per-track deltas) are measured from the fastest car and lap times right now."""
     tracks = table["tracks"]
-    deltas = {t: (times_ms[t] / table["refs_ms"][t] - 1) * 100 for t in tracks}
-    score = sum(deltas.values()) / len(tracks)
+    score = car_score(times_ms, tracks)
     cuts = table["cuts"]
     label = _label(bisect.bisect_right(cuts, score) + 1)
-    gap = ((1 + score / 100) / (1 + table["base_score"] / 100) - 1) * 100
-    variance = max(deltas.values()) - min(deltas.values())
+    base = live["base"] if live["base"] is not None else score
+    gap = max(0.0, math.expm1(score - base) * 100)
+    deltas = {t: max(0.0, (times_ms[t] / live["refs"].get(t, times_ms[t]) - 1) * 100) for t in tracks}
+    # balance: how this car's lap times sit on each track compared with its class's average, with the overall level
+    # taken out. A slow car that is slow in the usual way for its class has a balance of 0 however far behind it is.
+    norms = table["norms"].get(label, {})
+    off = [math.log(times_ms[t]) - norms[t] for t in tracks if t in norms]       # > 0: slower here than the class usually is
+    variance = math.expm1(max(off) - min(off)) * 100 if len(off) == len(tracks) else 0.0
     flags, bop = [], ""
     if cuts:
-        logs = _cut_logs(cuts)
-        y = math.log1p(score / 100)
-        k = _nearest_cut(logs, y)
-        dist = (math.exp(abs(logs[k] - y)) - 1) * 100
+        k = _nearest_cut(cuts, score)
+        dist = math.expm1(abs(cuts[k] - score)) * 100
         if dist < table["tie_zone"]:
             flags.append("borderline %s/%s (%.2f%%)" % (_label(k + 1), _label(k + 2), dist))
-    if variance > table["class_gap"]:
+    if variance > table.get("variance_limit", table["class_gap"]):
         flags.append("high variance (%.1f%%)" % variance)
     bits = []
     for t in tracks:
-        norm = table["norms"].get(label, {}).get(t)
-        if norm is not None and norm - deltas[t] > 0.25 * table["class_gap"]:
-            bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], norm - deltas[t]))
+        if t in norms:
+            faster = -(math.log(times_ms[t]) - norms[t])   # > 0: this car is quicker here than its class usually is
+            if faster * 100 > 0.25 * table["class_gap"]:
+                bits.append("%s: needs to be %.2f%% slower" % (t.partition("/")[0], math.expm1(faster) * 100))
     bop = "; ".join(bits)
-    return {"class": label, "score_pct": score, "gap_pct": gap, "deltas": deltas, "variance_pct": variance,
+    return {"class": label, "score_pct": gap, "gap_pct": gap, "deltas": deltas, "variance_pct": variance,
             "flags": flags, "bop": bop}
 
 
-def publish_classes(db, cfg, include_provisional=False):
-    """Cut a new class table from the merged data (natural breaks via ac_rating) and store it."""
-    wanted = ("verified", "provisional") if include_provisional else ("verified",)
-    per_car = {}
-    for r in db.execute("SELECT car_hash, track, score_ms, status FROM merged"):
-        if r["status"] in wanted:
-            per_car.setdefault(r["car_hash"], {})[r["track"]] = r["score_ms"]
-    results = {h: v for h, v in per_car.items() if all(t in v for t in cfg["tracks"])}
-    if len(results) < 2:
-        raise SystemExit("Not enough cars with complete data (%d). Need at least 2." % len(results))
-    cars, summ = ac_rating.rate(results, cfg["tracks"], class_gap=cfg["class_gap"], min_size=cfg["min_class_size"])
-    order = sorted(cars.values(), key=lambda c: (c["score"], c["id"]))
-    cuts, pos = [], 0
-    for cl in summ["classes"][:-1]:
-        pos += cl["n"]
-        y1, y2 = math.log1p(order[pos - 1]["score"] / 100), math.log1p(order[pos]["score"] / 100)
-        cuts.append(math.expm1((y1 + y2) / 2) * 100)
-    refs = {t: min(v[t] for v in results.values()) for t in cfg["tracks"]}
-    labels = [class_label(i + 1) for i in range(len(summ["classes"]))]
-    norms = {}
-    for c in order:
-        for ti, t in enumerate(cfg["tracks"]):
-            norms.setdefault(c["cls"], {}).setdefault(t, []).append(c["deltas"][ti])
-    norms = {lab: {t: statistics.median(v) for t, v in d.items()} for lab, d in norms.items()}
-    version = (db.execute("SELECT MAX(version) AS v FROM class_tables").fetchone()["v"] or 0) + 1
-    body = {"version": version, "created": now(), "profile": cfg["profile"], "tracks": cfg["tracks"],
-            "refs_ms": refs, "cuts": cuts, "labels": labels, "norms": norms, "base_score": order[0]["score"],
-            "class_gap": cfg["class_gap"], "tie_zone": cfg["tie_zone"], "n_cars": len(order),
-            "classes": [{"label": c["label"], "n": c["n"], "lo": c["lo"], "hi": c["hi"], "width": c["width"]}
-                        for c in summ["classes"]],
-            "include_provisional": include_provisional}
-    db.execute("INSERT INTO class_tables(version, created, body) VALUES(?,?,?)", (version, now(), json.dumps(body)))
-    bump(db)
+_class_wake = threading.Event()   # set whenever results change; wakes this process's class refresher
+
+
+def _class_params(cfg):
+    return json.dumps([CLASS_FORMAT, cfg["profile"], cfg["tracks"], cfg["class_gap"], cfg["min_class_size"], cfg["tie_zone"],
+                       bool(cfg["include_provisional"]), cfg["variance_limit_pct"]])
+
+
+def class_table_stale(db, cfg):
+    row = db.execute("SELECT dv, params FROM class_table WHERE id=1").fetchone()
+    return row is None or row["dv"] != data_version(db) or row["params"] != _class_params(cfg)
+
+
+BUCKETS_PER_CLASS = 20   # score buckets per class width: borders are found to within 1/20 of a class
+
+
+def build_class_table(db, cfg):
+    """Work the class borders out of the time table. The database averages each car's ln lap times and counts the
+    cars into small score buckets (grouped queries, nothing is kept per car); the border search then runs on the
+    buckets, so its time depends on how wide the field is, not on how many cars there are. -> (table body, fastest
+    score), or None when fewer than two cars are rated."""
+    tracks = cfg["tracks"]
+    tm = ",".join("?" * len(tracks))
+    # one row per car that is rated: results on every track, none disputed (and none provisional unless asked for)
+    cars_sql = ("SELECT car_hash, AVG(CASE WHEN track IN (%s) THEN ln_ms END) AS s, SUM(track IN (%s)) AS n, "
+                "SUM(status='disputed') AS d, SUM(status='provisional') AS p FROM merged GROUP BY car_hash" % (tm, tm))
+    db.execute("DROP TABLE IF EXISTS temp.rated")   # scratch copy for this build (the connection's own temp database), so the laps are only scanned once
+    db.execute("CREATE TEMP TABLE rated AS SELECT car_hash, s, p FROM (%s) WHERE n=? AND d=0" % cars_sql, tuple(tracks) * 2 + (len(tracks),))
+    eligible = "SELECT car_hash, s FROM temp.rated%s" % ("" if cfg["include_provisional"] else " WHERE p=0")
+    n, low = db.execute("SELECT COUNT(*), MIN(s) FROM (%s)" % eligible).fetchone()
+    if n < 2:
+        return None
+    best = db.execute("SELECT MIN(s) FROM temp.rated").fetchone()[0]
+    width = math.log1p(cfg["class_gap"] / 100)
+    step = width / BUCKETS_PER_CLASS
+    rows = db.execute("SELECT CAST((s - ?) / ? AS INTEGER) AS b, COUNT(*), AVG(s), MIN(s), MAX(s) FROM (%s) GROUP BY b ORDER BY b" % eligible,
+                      (low, step)).fetchall()
+    ids, cnt, pos = [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+    lo_s, hi_s = [r[3] for r in rows], [r[4] for r in rows]
+    classes = ac_rating.class_borders(pos, cnt, cfg["class_gap"], cfg["min_class_size"])
+    labels = [class_label(i + 1) for i in range(len(classes))]
+    cuts = [(hi_s[a_end] + lo_s[b_start]) / 2 for (_, a_end), (b_start, _) in zip(classes, classes[1:])]
+    class_of = {}
+    for ci, (a_, b_) in enumerate(classes):
+        for bi in range(a_, b_ + 1):
+            class_of[ids[bi]] = labels[ci]
+    sums = {}
+    for b_id, track, total, count in db.execute(
+            "SELECT x.b, m.track, SUM(m.ln_ms), COUNT(*) FROM (SELECT car_hash, CAST((s - ?) / ? AS INTEGER) AS b FROM (%s)) x "
+            "JOIN merged m ON m.car_hash = x.car_hash WHERE m.track IN (%s) GROUP BY x.b, m.track" % (eligible, tm),
+            (low, step) + tuple(tracks)):
+        if b_id in class_of and total is not None:
+            acc = sums.setdefault(class_of[b_id], {}).setdefault(track, [0.0, 0])
+            acc[0] += total
+            acc[1] += count
+    norms = {lab: {t: v[0] / v[1] for t, v in d.items()} for lab, d in sums.items()}
+    summary = []
+    for ci, (a_, b_) in enumerate(classes):
+        lo, hi = lo_s[a_], hi_s[b_]
+        summary.append({"label": labels[ci], "n": sum(cnt[a_:b_ + 1]), "lo": math.expm1(lo - best) * 100,
+                        "hi": math.expm1(hi - best) * 100, "width": math.expm1(hi - lo) * 100})
+    refs = {}
+    for t in tracks:
+        v = db.execute("SELECT MIN(score_ms) FROM merged WHERE track=? AND status IN ('verified','provisional')", (t,)).fetchone()[0]
+        if v is not None:
+            refs[t] = v
+    body = {"format": CLASS_FORMAT, "profile": cfg["profile"], "tracks": tracks, "refs_ms": refs, "cuts": cuts, "labels": labels,
+            "norms": norms, "class_gap": cfg["class_gap"], "tie_zone": cfg["tie_zone"], "variance_limit": cfg["variance_limit_pct"],
+            "n_cars": n, "classes": summary,
+            "include_provisional": bool(cfg["include_provisional"])}
+    return body, best
+
+
+def refresh_classes(db, cfg, force=False):
+    """Bring the class table up to date with the time table. -> (table, rebuilt). The version number only goes up
+    when the borders or labels actually change."""
+    row = db.execute("SELECT rev, dv, params, body FROM class_table WHERE id=1").fetchone()
+    dv, params = data_version(db), _class_params(cfg)   # read before the data, so a change in between leaves it stale
+    if row and not force and row["dv"] == dv and row["params"] == params:
+        return latest_table(db), False
+    prev = json.loads(row["body"]) if row else None
+    db.execute("BEGIN")          # one snapshot for all the queries of this build
+    try:
+        built = build_class_table(db, cfg)
+    finally:
+        db.rollback()
+    if built is None:
+        return latest_table(db), False
+    body, best = built
+    same = prev is not None and all(prev.get(k) == body[k] for k in ("format", "profile", "tracks", "cuts", "labels"))
+    version = (prev["version"] if same else prev["version"] + 1) if prev else 1
+    body["version"], body["created"] = version, now()
+    if row:
+        # compare-and-set: another worker may have rebuilt in the meantime, then theirs stands
+        cur = db.execute("UPDATE class_table SET rev=rev+1, version=?, built=?, dv=?, params=?, body=?, best=? WHERE id=1 AND rev=?",
+                         (version, body["created"], dv, params, json.dumps(body), best, row["rev"]))
+        if cur.rowcount == 0:
+            db.rollback()
+            return latest_table(db), False
+    else:
+        db.execute("INSERT OR IGNORE INTO class_table(id, rev, version, built, dv, params, body, best) VALUES(1, 1, ?, ?, ?, ?, ?, ?)",
+                   (version, body["created"], dv, params, json.dumps(body), best))
     db.commit()
-    return body, summ
+    return latest_table(db), True
+
+
+_refreshers = set()
+
+
+def start_refresher(db_path):
+    """Background thread that keeps the class table current: it wakes when results change here, and also looks every
+    few seconds, so changes made by another worker or the command line are picked up too."""
+    if db_path in _refreshers or os.environ.get("ACB_NO_REFRESH"):
+        return
+    _refreshers.add(db_path)
+    threading.Thread(target=_refresh_loop, args=(db_path,), name="class-refresh", daemon=True).start()
+
+
+def _refresh_loop(db_path, poll=5.0):
+    last, cost = None, 0.0   # when the table was last rebuilt here and how long that took; the first rebuild does not wait
+    while True:
+        try:
+            db = request_db(db_path)
+            cfg = get_config(db)
+            if class_table_stale(db, cfg):
+                if last is not None:   # wait at least the configured time, and five times a rebuild's duration so a big table never hogs the CPU
+                    time.sleep(max(0.0, last + max(max(1, int(cfg["class_refresh_seconds"])), 5 * cost) - time.monotonic()))
+                last, cpu = time.monotonic(), time.thread_time()
+                refresh_classes(db, cfg)
+                cost = time.thread_time() - cpu   # CPU time, so a busy server does not stretch the wait
+        except Exception as e:   # the database may be busy or gone; try again on the next round
+            sys.stderr.write("class refresh failed: %r\n" % (e,))
+            _local.conns = {}
+        if _class_wake.wait(poll):
+            time.sleep(0.3)      # let the request that woke us finish its commit
+            _class_wake.clear()
+
+
+def car_status(statuses, have, tracks):
+    """One car's status from its per-track merge statuses; `have` is the set of tracks it has a result for."""
+    if "disputed" in statuses:
+        return "disputed"
+    if any(t not in have for t in tracks):
+        return "incomplete"
+    if "provisional" in statuses:
+        return "provisional"
+    return "verified"
+
+
+def car_counts(db, cfg):
+    """How many cars are in each status (cars, not track results: one car has a result per track)."""
+    per = {}
+    for h, track, status in db.execute("SELECT car_hash, track, status FROM merged"):
+        sts, have = per.setdefault(h, ([], set()))
+        sts.append(status)
+        have.add(track)
+    counts = {"verified": 0, "provisional": 0, "incomplete": 0, "disputed": 0}
+    for sts, have in per.values():
+        counts[car_status(sts, have, cfg["tracks"])] += 1
+    return counts
 
 
 def car_records(db, cfg, only_hash=None, only_hashes=None):
     table = latest_table(db)
     q = "SELECT car_hash, track, score_ms, n_used, status, updated FROM merged"
     args = ()
-    names_q, names_args = "SELECT car_hash, car_id, name FROM cars", ()
+    names_q, names_args = "SELECT car_hash, car_id, name, added FROM cars", ()
     if only_hashes is not None:
         only_hashes = sorted(set(only_hashes))
         marks = ",".join("?" * len(only_hashes))
@@ -493,27 +700,20 @@ def car_records(db, cfg, only_hash=None, only_hashes=None):
     cur.row_factory = None   # plain tuples: this loop runs once per car and per track
     for h, track, score_ms, n_used, status, updated in cur.execute(q, args):
         per_car.setdefault(h, {})[track] = (score_ms, n_used, status, updated)
-    names = {h: (car_id, name) for h, car_id, name in cur.execute(names_q, names_args)}
+    names = {h: (car_id, name, added) for h, car_id, name, added in cur.execute(names_q, names_args)}
     tracks = cfg["tracks"]
     classed = table["tracks"] if table else None
+    live = live_reference(db, tracks) if table else None
     out = []
     for h, per in sorted(per_car.items()):
-        sts = [v[2] for v in per.values()]
-        if "disputed" in sts:
-            status = "disputed"
-        elif any(t not in per for t in tracks):
-            status = "incomplete"
-        elif "provisional" in sts:
-            status = "provisional"
-        else:
-            status = "verified"
-        car_id, name = names.get(h, ("", ""))
+        status = car_status([v[2] for v in per.values()], per, tracks)
+        car_id, name, added = names.get(h, ("", "", None))
         rec = {"car_hash": h, "car_id": car_id, "name": name,
                "status": status, "times_ms": {t: v[0] for t, v in per.items()},
-               "n": {t: v[1] for t, v in per.items()}, "updated": max(v[3] for v in per.values()),
+               "n": {t: v[1] for t, v in per.items()}, "updated": max(v[3] for v in per.values()), "added": added,
                "class": None}
         if table and status in ("verified", "provisional"):
-            rec.update(classify(table, {t: per[t][0] for t in classed}))
+            rec.update(classify(table, {t: per[t][0] for t in classed}, live))
         out.append(rec)
     return table, out
 
@@ -815,18 +1015,21 @@ def handle_submit(db, cfg, environ):
             [(user["id"], n["car_hash"], n["car_id"], n["name"], n["track"], n["score_ms"], n["spread_pct"],
               json.dumps(n["laps"]), n["batch"], n["env_id"], t) for n in valid])
         db.executemany(
-            "INSERT INTO cars(car_hash, car_id, name, updated) VALUES(?,?,?,?) ON CONFLICT(car_hash) DO UPDATE SET "
+            "INSERT INTO cars(car_hash, car_id, name, updated, added) VALUES(?,?,?,?,?) ON CONFLICT(car_hash) DO UPDATE SET "
             "car_id=excluded.car_id, name=excluded.name, updated=excluded.updated",
-            [(n["car_hash"], n["car_id"], n["name"], t) for n in valid])
+            [(n["car_hash"], n["car_id"], n["name"], t, t) for n in valid])
         touched = {(n["car_hash"], n["track"]) for n in valid}
         for h, tr in touched:
             key = recompute(db, cfg, h, tr) or "none"
             status[key] = status.get(key, 0) + 1
+        note_fastest(db, cfg, [h for h, _ in touched])
         bump(db)
         db.commit()
     # the server decides the class: answer with the current record (class, gap, status, flags) of every car just touched
     cars = []
     if touched:
+        if latest_table(db) is None:
+            refresh_classes(db, cfg)   # the very first table: no reason to make the uploader wait for the refresher
         table, cars = car_records(db, cfg, only_hashes={h for h, _ in touched})
     return respond(200, {"accepted": accepted, "rejected": rejected, "rejected_total": len(entries) - accepted,
                          "merged_status": status, "cars": cars, "tracks": cfg["tracks"],
@@ -853,7 +1056,7 @@ def _build_export(db, cfg, table, tv, dv):
 
 def handle_classes(db, cfg, environ):
     table = latest_table(db)
-    tv, dv, ttl = (table["version"] if table else 0), data_version(db), max(0, int(cfg.get("export_max_age", 0)))
+    tv, dv, ttl = (table.rev if table else 0), data_version(db), max(0, int(cfg.get("export_max_age", 0)))
     c = _export
     if not _export_fresh(c, tv, dv, ttl):
         # one thread rebuilds. Others keep getting the previous export while it runs (it is at most a rebuild old),
@@ -906,8 +1109,8 @@ def handle_lookup(db, cfg, environ):
 def _admin_ctx():
     """The server functions admin.py needs (injected so admin.py never imports this module)."""
     return SimpleNamespace(HttpError=HttpError, respond=respond, read_json=read_json, recompute=recompute,
-                           bump=bump, publish_classes=publish_classes, set_config=set_config,
-                           latest_table=latest_table, parse_env=parse_env, apply_env=apply_env,
+                           bump=bump, refresh_classes=refresh_classes, set_config=set_config,
+                           latest_table=latest_table, car_counts=car_counts, parse_env=parse_env, apply_env=apply_env,
                            new_invite_code=new_invite_code, invite_hash=invite_hash)
 
 
@@ -953,6 +1156,7 @@ def route(environ, db_path):
 
 def create_app(db_path):
     init_db(db_path).close()
+    start_refresher(db_path)
 
     def app(environ, start_response):
         try:
@@ -1114,21 +1318,24 @@ def cmd_admin(args):
         bump(db)
         db.commit()
         print("recomputed", len(keys))
-    elif c == "publish-classes":
-        body, summ = publish_classes(db, cfg, args.include_provisional)
-        print("class table v%d: %d cars, %d classes" % (body["version"], body["n_cars"], len(body["labels"])))
-        for cl in body["classes"]:
+    elif c == "recalc-classes":
+        table, _ = refresh_classes(db, cfg, force=True)
+        if table is None:
+            raise SystemExit("Not enough cars with complete data yet (need at least 2).")
+        print("class table v%d: %d cars, %d classes" % (table["version"], table["n_cars"], len(table["labels"])))
+        for cl in table["classes"]:
             print("  %s: %3d cars, rating %.2f%% .. %.2f%%" % (cl["label"], cl["n"], cl["lo"], cl["hi"]))
-        for w in summ["warnings"][:10]:
-            print("WARNING:", w)
     elif c == "stats":
-        for label, q in (("users", "SELECT COUNT(*) FROM users"), ("banned", "SELECT COUNT(*) FROM users WHERE banned=1"),
-                         ("submissions", "SELECT COUNT(*) FROM submissions"),
-                         ("verified", "SELECT COUNT(*) FROM merged WHERE status='verified'"),
-                         ("provisional", "SELECT COUNT(*) FROM merged WHERE status='provisional'"),
-                         ("disputed", "SELECT COUNT(*) FROM merged WHERE status='disputed'"),
-                         ("class tables", "SELECT COUNT(*) FROM class_tables")):
+        counts = car_counts(db, cfg)
+        for label, n in (("cars rated", counts["verified"] + counts["provisional"]), ("verified", counts["verified"]),
+                         ("provisional", counts["provisional"]), ("incomplete", counts["incomplete"]),
+                         ("disputed", counts["disputed"])):
+            print("%-12s %d" % (label, n))
+        for label, q in (("users", "SELECT COUNT(*) FROM users"), ("banned", "SELECT COUNT(*) FROM users WHERE banned=1")):
             print("%-12s %d" % (label, db.execute(q).fetchone()[0]))
+        table = latest_table(db)
+        print("%-12s %s" % ("class table", "v%d, %d cars, %d classes" % (table["version"], table["n_cars"], len(table["labels"]))
+                            if table else "none yet"))
     elif c == "disputed":
         for m in db.execute("SELECT car_hash, track FROM merged WHERE status='disputed'"):
             subs = db.execute("SELECT u.name, s.car_id, s.score_ms FROM submissions s JOIN users u ON u.id=s.user_id "
@@ -1168,8 +1375,7 @@ def main():
     s.add_argument("--role", choices=["user", "trusted"], required=True)
     sub.add_parser("recompute-all")
     sub.add_parser("backup").add_argument("--to", required=True, help="file to write a consistent copy of the database to")
-    s = sub.add_parser("publish-classes")
-    s.add_argument("--include-provisional", action="store_true")
+    sub.add_parser("recalc-classes")
     sub.add_parser("stats")
     sub.add_parser("disputed")
     s = sub.add_parser("config")

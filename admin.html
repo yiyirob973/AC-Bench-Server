@@ -79,7 +79,7 @@ function usersView() {
     const rows = j.users.map(u => h("tr", {},
       h("td", {}, u.name), h("td", {}, h("span", { class: "tag" }, u.role)),
       h("td", { class: u.banned ? "bad" : "ok" }, u.banned ? "banned" : "active"),
-      h("td", {}, u.submissions), h("td", {}, u.devices), h("td", { class: "mut" }, when(u.created)),
+      h("td", {}, u.cars), h("td", {}, u.devices), h("td", { class: "mut" }, when(u.created)),
       h("td", {}, h("div", { class: "row" },
         u.banned ? btn("Unban", () => act("users/" + u.id + "/unban", {}, r => "Unbanned, " + r.recomputed + " entries recomputed"))
                  : btn("Ban", () => act("users/" + u.id + "/ban", {}, r => "Banned, " + r.recomputed + " entries recomputed"), "danger"),
@@ -88,7 +88,7 @@ function usersView() {
     const first = j.total ? j.offset + 1 : 0, last = j.offset + j.users.length;
     const go = off => { usersState.offset = Math.max(0, off); refresh().catch(e => toast("Error: " + e.message)); };
     body.replaceChildren(
-      h("table", {}, h("tr", {}, ["Name", "Role", "Status", "Submissions", "Devices", "Created", ""].map(x => h("th", {}, x))), rows),
+      h("table", {}, h("tr", {}, ["Name", "Role", "Status", "Cars", "Devices", "Created", ""].map(x => h("th", {}, x))), rows),
       h("div", { class: "row" }, h("span", { class: "mut" }, first + "–" + last + " of " + j.total),
         j.offset > 0 ? btn("Previous", () => go(j.offset - j.limit)) : "",
         last < j.total ? btn("Next", () => go(j.offset + j.limit)) : ""));
@@ -131,13 +131,18 @@ function disputedView(list) {
                 : h("span", { class: "mut" }, "None."));
 }
 function classesView(d) {
+  const c = d.classes, t = c.table;
   const prov = h("input", { type: "checkbox" });
-  return h("section", {}, h("h2", {}, "Class tables"), h("div", { class: "row" },
-    btn("Publish new class table", () => act("publish", { include_provisional: prov.checked }, j => "Published v" + j.version + ": " + j.n_cars + " cars, " + j.classes + " classes",
-      "Publish a new class table? Cars may change class for all clients."), ""),
-    h("label", {}, prov, " include provisional"), btn("Recompute all merges", () => act("recompute", {}, j => "Recomputed " + j.recomputed + " entries", "Recompute every merged result?"))),
-    h("table", {}, h("tr", {}, ["Version", "Created", "Cars", "Classes", "Provisional"].map(x => h("th", {}, x))),
-      d.class_tables.map(t => h("tr", {}, h("td", {}, "v" + t.version), h("td", { class: "mut" }, when(t.created)), h("td", {}, t.n_cars), h("td", {}, t.classes), h("td", {}, t.include_provisional ? "yes" : "no")))));
+  prov.checked = c.include_provisional;
+  return h("section", {}, h("h2", {}, "Class table"),
+    h("p", { class: "mut" }, t
+      ? "Live, version " + t.version + ": " + t.n_cars + " cars in " + t.classes + " classes, last rebuilt " + when(t.created) +
+        ". It follows new results on its own (about every " + c.refresh_seconds + " s at most); the version only goes up when the borders move."
+      : "No class table yet. It appears once two cars have verified results on every track."),
+    h("div", { class: "row" },
+      h("label", {}, prov, " also use provisional results"),
+      btn("Save and rebuild now", () => act("classes", { include_provisional: prov.checked }, j => "Rebuilt: v" + j.version + ", " + j.n_cars + " cars, " + j.classes + " classes")),
+      btn("Recompute all merges", () => act("recompute", {}, j => "Recomputed " + j.recomputed + " entries", "Recompute every merged result?"))));
 }
 function benchmarkView(b) {
   const profile = h("input", { value: b.profile });

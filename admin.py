@@ -8,7 +8,7 @@ Routes (all under /admin; nothing here is reachable without a valid admin sessio
     POST /admin/logout
     GET  /admin/api/overview        everything the dashboard shows
     POST /admin/api/env             set the canonical environment (what `set-env` does) from an uploaded track reference
-    POST /admin/api/...             actions (ban, role, invites, publish, ...), CSRF protected
+    POST /admin/api/...             actions (ban, role, invites, classes, ...), CSRF protected
 
 Configuration (environment variables; secrets are deliberately NOT stored in the SQLite config):
     ACB_PUBLIC_URL          public origin of this server, e.g. https://bench.example.com
@@ -48,6 +48,7 @@ EDITABLE = {
     "spread_limit_pct": (float, 0.1, 10), "export_max_age": (int, 0, 3600),
     "rate_submits_per_hour": (int, 1, 10000), "rate_register_per_hour": (int, 1, 10000), "rate_lookups_per_hour": (int, 1, 100000),
     "class_gap": (float, 0.1, 20), "min_class_size": (int, 1, 100), "tie_zone": (float, 0, 5),
+    "variance_limit_pct": (float, 0.1, 100),
 }
 
 
@@ -314,8 +315,8 @@ def _condition_warnings(cfg, table, changed):
             w.append("No reference digest yet for %s; uploads for them are refused until a track reference "
                      "that includes them is loaded." % ", ".join(missing))
     if table and (table.get("profile") != cfg["profile"] or table.get("tracks") != cfg["tracks"]):
-        w.append("Published class table v%d was built for a different profile/tracks; publish a new one once "
-                 "enough new results are verified." % table["version"])
+        w.append("The class table (v%d) still reflects the old profile/tracks. It is rebuilt by itself once at least "
+                 "two cars have verified results on every new track." % table["version"])
     return w
 
 
@@ -335,7 +336,7 @@ def list_users(db, ctx, environ):
     total = db.execute("SELECT COUNT(*) FROM users u " + where, args).fetchone()[0]
     users = [dict(r) for r in db.execute(
         "SELECT u.id, u.name, u.role, u.banned, u.created, "
-        "(SELECT COUNT(*) FROM submissions s WHERE s.user_id=u.id) AS submissions, "
+        "(SELECT COUNT(DISTINCT s.car_hash) FROM submissions s WHERE s.user_id=u.id) AS cars, "
         "1 + (SELECT COUNT(*) FROM user_keys k WHERE k.user_id=u.id) AS devices FROM users u " + where +
         " ORDER BY u.created DESC, u.id DESC LIMIT ? OFFSET ?", args + [limit, offset])]
     return {"users": users, "total": total, "limit": limit, "offset": offset}
@@ -343,12 +344,10 @@ def list_users(db, ctx, environ):
 
 def overview(db, cfg, ctx, sess):
     q = lambda sql: db.execute(sql).fetchone()[0]
-    stats = {"users": q("SELECT COUNT(*) FROM users"), "banned": q("SELECT COUNT(*) FROM users WHERE banned=1"),
-             "submissions": q("SELECT COUNT(*) FROM submissions"),
-             "verified": q("SELECT COUNT(*) FROM merged WHERE status='verified'"),
-             "provisional": q("SELECT COUNT(*) FROM merged WHERE status='provisional'"),
-             "disputed": q("SELECT COUNT(*) FROM merged WHERE status='disputed'"),
-             "class_tables": q("SELECT COUNT(*) FROM class_tables")}
+    cars = ctx.car_counts(db, cfg)   # counted per car, not per track result or per upload
+    stats = {"cars_rated": cars["verified"] + cars["provisional"], "verified": cars["verified"],
+             "provisional": cars["provisional"], "incomplete": cars["incomplete"], "disputed": cars["disputed"],
+             "users": q("SELECT COUNT(*) FROM users"), "banned": q("SELECT COUNT(*) FROM users WHERE banned=1")}
     invites = [dict(r) for r in db.execute(
         "SELECT code_hash AS id, role, uses_left, created FROM invites ORDER BY created DESC LIMIT 100")]
     disputed = []
@@ -358,15 +357,14 @@ def overview(db, cfg, ctx, sess):
             "JOIN users u ON u.id=s.user_id WHERE s.car_hash=? AND s.track=? ORDER BY s.score_ms",
             (m["car_hash"], m["track"]))]
         disputed.append({"car_hash": m["car_hash"], "track": m["track"], "submissions": subs})
-    tables = []
-    for r in db.execute("SELECT version, created, body FROM class_tables ORDER BY version DESC LIMIT 20"):
-        b = json.loads(r["body"])
-        tables.append({"version": r["version"], "created": r["created"], "n_cars": b.get("n_cars"),
-                       "classes": len(b.get("labels", [])), "include_provisional": b.get("include_provisional", False)})
+    table = ctx.latest_table(db)
+    classes = {"include_provisional": bool(cfg.get("include_provisional")), "refresh_seconds": cfg.get("class_refresh_seconds"),
+               "table": {"version": table["version"], "created": table["created"], "n_cars": table["n_cars"],
+                         "classes": len(table["labels"])} if table else None}
     env = cfg.get("env")
     audit = [dict(r) for r in db.execute("SELECT ts, actor, action, detail FROM admin_audit ORDER BY id DESC LIMIT 50")]
     return {"me": {"name": sess["name"], "email": sess["email"], "sub": sess["sub"], "csrf": sess["csrf"]},
-            "stats": stats, "invites": invites, "disputed": disputed, "class_tables": tables,
+            "stats": stats, "invites": invites, "disputed": disputed, "classes": classes,
             "config": {k: cfg[k] for k in EDITABLE},
             "benchmark": {"profile": cfg["profile"], "tracks": cfg["tracks"], "laps": cfg["laps"],
                           "max_batch": cfg["max_batch"], "conditions": cfg.get("conditions") or {}},
@@ -458,14 +456,16 @@ def api(db, cfg, ctx, sess, environ, method, path, now):
         _audit(db, actor, "recompute_all", str(len(keys)))
         return ctx.respond(200, {"ok": True, "recomputed": len(keys)})
 
-    if parts == ["publish"]:
-        prov = bool(data.get("include_provisional"))
-        try:
-            body, _ = ctx.publish_classes(db, cfg, prov)
-        except SystemExit as e:  # publish_classes was written for the CLI and exits when data is insufficient
-            raise ctx.HttpError(422, str(e))
-        _audit(db, actor, "publish_classes", "v%d cars=%d provisional=%s" % (body["version"], body["n_cars"], prov))
-        return ctx.respond(200, {"version": body["version"], "n_cars": body["n_cars"], "classes": len(body["labels"])})
+    if parts == ["classes"]:
+        if "include_provisional" in data:
+            cfg["include_provisional"] = bool(data["include_provisional"])
+            ctx.set_config(db, cfg)
+            db.commit()
+        table, rebuilt = ctx.refresh_classes(db, cfg, force=True)
+        if table is None:
+            raise ctx.HttpError(422, "Not enough cars with results on every track yet (need at least 2).")
+        _audit(db, actor, "classes_recalc", "v%d cars=%d provisional=%s" % (table["version"], table["n_cars"], cfg["include_provisional"]))
+        return ctx.respond(200, {"version": table["version"], "n_cars": table["n_cars"], "classes": len(table["labels"])})
 
     if parts == ["conditions"]:
         try:
