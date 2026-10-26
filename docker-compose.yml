@@ -11,7 +11,9 @@
 services:
   acbench:
     build:
-      context: https://github.com/yiyirob973/AC-Bench-Server.git#dev
+      # Builds the repository's default branch. To build another branch, set ACB_REF (for example ACB_REF=dev). To
+      # build a copy you cloned instead, set ACB_CONTEXT=. so it uses the files in this folder.
+      context: "${ACB_CONTEXT:-https://github.com/yiyirob973/AC-Bench-Server.git}${ACB_REF:+#}${ACB_REF}"
       dockerfile: Dockerfile
     image: acbench-server:latest
     container_name: acbench
@@ -28,7 +30,7 @@ services:
       ACB_ADMIN_GROUPS: acb-admins   # or ACB_ADMIN_SUBS / ACB_ADMIN_EMAILS
     volumes:
       - acbench-data:/data                 # the database and backups
-      - ./import:/import:ro                # files you give the server (track_check_log.json for set-env)
+      - ./import:/import:ro                # files you give the server (track_reference.json for set-env)
     read_only: true
     tmpfs:
       - /tmp
