@@ -1,10 +1,24 @@
-# AC Bench Server
+<p align="center">
+  <img src="branding/ac-bench.png" alt="AC Bench logo" width="140">
+</p>
+
+<h1 align="center">AC Bench Server</h1>
+
+<p align="center">
+  The shared class list for AC Bench: collects benchmark results, checks them and tells the app which class each car is in.
+</p>
+
+---
 
 AC Bench sorts Assetto Corsa cars into classes by how fast they are on a standard benchmark, so you can put together grids where the cars are evenly matched. People run the benchmark on their own PC with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop) and upload the results. This server collects those results, checks them, combines them, and tells the app which class each car belongs to.
 
-## Do I need this?
+## Public server
 
-Most people don't. If you just want to benchmark cars or see their classes, use the desktop app. You will need an invite code from whoever runs the server you want to join.
+The public server is **https://bench.cauch.uk**. To use it, install the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop), enter that address on the Setup tab and register with an invite code. Its page with every car and its class is at the same address.
+
+## Do I need this repository?
+
+Most people don't. If you just want to benchmark cars or see their classes, use the desktop app and a server that already exists, like the public one above.
 
 This repository is for people who run a server of their own, for example a community that wants its own shared class list.
 
@@ -44,7 +58,7 @@ A car can carry a flag. These are advice for building grids and have no effect o
 - Sign-up needs an invite code from the operator. Codes look like `XXXX-XXXX-XXXX-XXXX` and can be pasted in any case, with or without the hyphens.
 - Accounts are either `user` or `trusted`. A trusted user's results count as confirmed on their own.
 - There are no passwords. Each account has an API key that the app keeps. Keys are stored on the server as hashes only.
-- To use an account on another PC, the signed-in app asks the server for a single-use code (valid for 10 minutes), and the new device swaps it for its own key. Each device has a separate key.
+- To use an account on another PC, the signed-in app asks the server for a single-use code that expires after a few minutes, and the new device swaps it for its own key. Each device has a separate key.
 - Banning an account blocks all of its devices.
 
 ## How uploads are checked
@@ -57,7 +71,7 @@ An upload is turned away unless all of these hold:
 - the lap times are plausible and consistent with each other
 - the game setup matches the operator's approved reference
 
-The reference is a set of file fingerprints for the benchmark tracks and the game executable. It stops people uploading results from modified files or a different setup. The operator sets it from the desktop app's track reference file, either with `set-env` or in the admin dashboard.
+The reference is a set of file fingerprints for the benchmark tracks and the game executable. It stops people uploading results from modified files or a different setup. The operator creates it with the desktop app (from a clean install) and loads the resulting track reference file, either with `set-env` or in the admin dashboard.
 
 Cars are identified by the physics files that are actually installed (`data.acd` or the `data/` folder, plus `collider.ini`), not by folder name. A renamed or updated car mod can't inherit an old rating just because it kept its name.
 
@@ -65,25 +79,23 @@ The benchmark conditions, such as which tracks are used, are chosen by the opera
 
 ## Settings
 
-Every setting can be changed with `config set`, and most of them in the admin dashboard. Defaults are in brackets.
+Every setting can be changed with `config set`, and most of them in the admin dashboard. `config get` shows the current values.
 
 | Setting | What it does |
 |---|---|
-| `tolerance_pct` (0.5) | Two results agree if they are within this percentage of each other |
-| `min_confirmations` (2) | How many different people must agree for a result to be verified |
-| `spread_limit_pct` (1.5) | The most an upload's own timed laps may differ, slowest against fastest, as a percentage |
-| `class_gap` (2) | The widest a class may be, as a percentage of lap time |
-| `min_class_size` (3) | The smallest class the server will make if it can avoid it |
-| `tie_zone` (0.1) | How close to a class border a car must be to get the borderline flag |
-| `variance_limit_pct` (3) | How unusual a car's track balance must be to get the high variance flag |
-| `include_provisional` (off) | Also use single-user results when working out the classes |
-| `class_refresh_seconds` (10) | The shortest time between two recalculations of the classes |
-| `export_max_age` (30) | How many seconds the full class download may lag behind new uploads. 0 means always current |
-| `rate_submits_per_hour` (20) | Uploads allowed per account per hour |
-| `rate_register_per_hour` (10) | Sign-up attempts allowed per address per hour |
-| `rate_lookups_per_hour` (240) | Car lookups allowed per address per hour |
-
-Settings like these may need adjusting once real results come in.
+| `tolerance_pct` | Two results agree if they are within this percentage of each other |
+| `min_confirmations` | How many different people must agree for a result to be verified |
+| `spread_limit_pct` | The most an upload's own timed laps may differ, slowest against fastest, as a percentage |
+| `class_gap` | The widest a class may be, as a percentage of lap time |
+| `min_class_size` | The smallest class the server will make if it can avoid it |
+| `tie_zone` | How close to a class border a car must be to get the borderline flag |
+| `variance_limit_pct` | How unusual a car's track balance must be to get the high variance flag |
+| `include_provisional` | Also use single-user results when working out the classes |
+| `class_refresh_seconds` | The shortest time between two recalculations of the classes |
+| `export_max_age` | How many seconds the full class download may lag behind new uploads. 0 means always current |
+| `rate_submits_per_hour` | Uploads allowed per account per hour |
+| `rate_register_per_hour` | Sign-up attempts allowed per address per hour |
+| `rate_lookups_per_hour` | Car lookups allowed per address per hour |
 
 ## Running your own server
 
@@ -91,11 +103,11 @@ Docker Compose is the easiest way. The compose file builds the server straight f
 
 ```bash
 mkdir acbench-server && cd acbench-server
-curl -L https://raw.githubusercontent.com/yiyirob973/AC-Bench-Server/main/docker-compose.yml -o docker-compose.yml
+curl -L https://raw.githubusercontent.com/yiyirob973/AC-Bench-Server/HEAD/docker-compose.yml -o docker-compose.yml
 docker compose up -d --build
 ```
 
-Or clone the repository and run `docker compose up -d --build` from it. The server listens on port 8080. The database lives in a Docker volume, and `./import` is mounted read-only so you can drop in files such as the track reference before running admin commands.
+The image is built from the repository's default branch. Set `ACB_REF` to build another branch, for example `ACB_REF=dev docker compose up -d --build`. If you cloned the repository and want to build your own copy of the files, set `ACB_CONTEXT=.` the same way. The server listens on port 8080. The database lives in a Docker volume, and `./import` is mounted read-only so you can drop in files such as the track reference before running admin commands.
 
 Put the server behind a reverse proxy that handles HTTPS. Don't expose port 8080 to the internet directly, and don't run it without TLS anywhere other than your own machine, because API keys travel in a request header.
 
@@ -103,7 +115,7 @@ First-time setup:
 
 ```bash
 docker compose exec acbench python server.py init
-docker compose exec acbench python server.py set-env --from /import/track_check_log.json
+docker compose exec acbench python server.py set-env --from /import/track_reference.json
 docker compose exec acbench python server.py invite --role user --uses 20
 ```
 
@@ -131,7 +143,7 @@ If any of the required variables is missing, the dashboard stays closed.
 
 ### Backups
 
-`backup.sh` makes a copy of the database while the server is running and keeps 30 days of them. Run it from cron, and copy the backups off the machine. If you restore a database by hand, restart the container afterwards.
+`backup.sh` makes a copy of the database while the server is running and keeps recent copies. Run it from cron, and copy the backups off the machine. If you restore a database by hand, restart the container afterwards.
 
 If you have several CPU cores, set `WEB_CONCURRENCY` in the compose file to run more worker processes.
 
@@ -174,13 +186,13 @@ Run these with `python server.py <command>` (or through `docker compose exec acb
 | `POST` | `/v1/submit` | Upload results (needs the API key as a bearer token) |
 | `GET` | `/v1/classes` | The whole class table and every car, in one download |
 | `GET` | `/v1/cars/<car_hash>` | One car's record |
-| `POST` | `/v1/cars/lookup` | Records for up to 500 cars at once |
+| `POST` | `/v1/cars/lookup` | Records for many cars at once |
 | `POST` | `/v1/devices/link` | Get a code for signing in on another device |
 | `POST` | `/v1/devices/redeem` | Swap that code for a key on the new device |
 
 An upload contains the `profile`, the `environments` and the `results`. The reply lists accepted and rejected entries with the reason for each rejection, and the current record for every car the upload touched: its class, status, flags and times.
 
-A lookup is `POST /v1/cars/lookup` with `{"hashes": [...]}`, holding 1 to 500 lowercase SHA-256 car hashes. No key is needed. Cars the server doesn't know are left out of the reply, and the answer is always current.
+A lookup is `POST /v1/cars/lookup` with `{"hashes": [...]}`, holding a list of lowercase SHA-256 car hashes. No key is needed. Cars the server doesn't know are left out of the reply, and the answer is always current.
 
 ## Privacy
 
@@ -202,6 +214,7 @@ admin.py             the admin dashboard's sign-in and actions
 admin.html           the admin dashboard page
 ac_rating.py         splits cars into classes and names them
 stats.html           the public cars page
+branding/            the logo files, served by the server and used in this README
 Dockerfile
 docker-compose.yml
 backup.sh            database backup, meant to run from cron

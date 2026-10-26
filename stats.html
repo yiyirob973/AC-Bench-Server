@@ -4,18 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AC Bench cars</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="/logo.png">
 <style>
 :root {
   color-scheme: light dark;
-  --paper: #edf0f4; --panel: #ffffff; --ink: #172033; --muted: #556176; --rule: #d2d9e4;
-  --accent: #0b6a5e; --accent-ink: #ffffff; --focus: #1858c8; --warn: #8a4b00;
+  --paper: #eaf1f6; --panel: #ffffff; --ink: #111d33; --muted: #4f647a; --rule: #cfdbe6;
+  --accent: #1b6f86; --accent-ink: #ffffff; --focus: #1858c8; --warn: #8a4b00;
   --chip-s: 60%; --chip-bg: 90%; --chip-fg: 24%;
   --font: Bahnschrift, "DIN Alternate", "Segoe UI Variable Text", system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --paper: #11151c; --panel: #19202a; --ink: #e6ebf3; --muted: #9ba7b9; --rule: #2c3543;
-    --accent: #38c4ae; --accent-ink: #05201b; --focus: #7aa9ff; --warn: #f0b259;
+    --paper: #0c1627; --panel: #111d33; --ink: #e8f1f8; --muted: #9fb3c8; --rule: #234259;
+    --accent: #74d4e0; --accent-ink: #06202a; --focus: #97e7f2; --warn: #f2c46d;
     --chip-s: 52%; --chip-bg: 25%; --chip-fg: 85%;
   }
 }
@@ -25,6 +27,9 @@ body { margin: 0; color: var(--ink); font: 15px/1.45 var(--font); font-variant-n
 .wrap { max-width: 1180px; margin: 0 auto; padding: 22px 20px 64px; }
 h1 { margin: 0; font-size: 28px; line-height: 1.1; font-weight: 700; font-stretch: 88%; }
 p { margin: 0; }
+header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+header img { width: 48px; height: 48px; flex: none; }
+.head { min-width: 0; }
 .sub { display: block; color: var(--muted); font-size: 12.5px; font-weight: 400; }
 #facts { color: var(--muted); margin-top: 6px; }
 #facts b { color: var(--ink); font-weight: 600; }
@@ -89,8 +94,11 @@ tr.detail td { background: color-mix(in srgb, var(--ink) 3%, transparent); }
 <body>
 <div class="wrap">
   <header>
-    <h1>AC Bench cars</h1>
-    <p id="facts"></p>
+    <img src="/logo.png" width="48" height="48" alt="">
+    <div class="head">
+      <h1>AC Bench cars</h1>
+      <p id="facts"></p>
+    </div>
   </header>
   <p id="msg" role="status">Loading the cars...</p>
 

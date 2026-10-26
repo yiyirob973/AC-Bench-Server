@@ -742,8 +742,9 @@ def etag_matches(environ, etag):
 _file_cache = {}   # file name -> (mtime_ns, size, body, gzipped body, etag)
 
 
-def serve_file(path, content_type, environ=None):
-    """Static page, read from disk once and again only when the file changes; revalidated with an ETag (304)."""
+def serve_file(path, content_type, environ=None, compress=True):
+    """Static page, read from disk once and again only when the file changes; revalidated with an ETag (304).
+    Pass compress=False for files that are already compressed, such as images."""
     environ = environ or {}
     p = HERE / path
     try:
@@ -760,7 +761,7 @@ def serve_file(path, content_type, environ=None):
     if etag_matches(environ, etag):
         return 304, b"", cache
     enc = []
-    if accepts_gzip(environ):
+    if compress and accepts_gzip(environ):
         body, enc = gz, [("Content-Encoding", "gzip")]
     return 200, body, [("Content-Type", content_type), ("Content-Length", str(len(body))),
                        ("X-Content-Type-Options", "nosniff")] + enc + cache
@@ -1114,10 +1115,16 @@ def _admin_ctx():
                            new_invite_code=new_invite_code, invite_hash=invite_hash)
 
 
+BRANDING_FILES = {"/favicon.ico": ("favicon.ico", "image/x-icon"), "/logo.png": ("logo.png", "image/png")}
+
+
 def route(environ, db_path):
     method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
     if method == "GET" and path in ("/", "/stats"):
         return serve_file("stats.html", "text/html; charset=utf-8", environ)
+    if method == "GET" and path in BRANDING_FILES:      # the logo and the tab icon
+        name, kind = BRANDING_FILES[path]
+        return serve_file("branding/" + name, kind, environ, compress=False)
     db = request_db(db_path)
     try:
         if method == "GET" and path == "/v1/health":
