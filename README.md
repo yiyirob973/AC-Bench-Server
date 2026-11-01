@@ -5,101 +5,116 @@
 <h1 align="center">AC Bench Server</h1>
 
 <p align="center">
-  The shared class list for AC Bench: collects benchmark results, checks them and tells the app which class each car is in.
+  Shared class ratings for Assetto Corsa cars. Collect benchmark results, validate them, and tell the app which class each car belongs to.
 </p>
 
 ---
 
-AC Bench sorts Assetto Corsa cars into classes by how fast they are on a standard benchmark, so you can put together grids where the cars are evenly matched. People run the benchmark on their own PC with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop) and upload the results. This server collects those results, checks them, combines them, and tells the app which class each car belongs to.
+AC Bench ranks Assetto Corsa cars by how fast they are on a standard benchmark, so players can build evenly matched grids instead of guessing from mods and car names.
+
+This repository runs the server that stores those results, checks them for consistency, and publishes the class table. The desktop app uploads lap times and asks the server which class each car belongs to.
 
 ## Public server
 
-The public server is **https://bench.cauch.uk**. To use it, install the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop), enter that address on the Setup tab and register with an invite code. Its page with every car and its class is at the same address.
+A public instance is available here:
 
-## Do I need this repository?
+- https://bench.cauch.uk
 
-Most people don't. If you just want to benchmark cars or see their classes, use the desktop app and a server that already exists, like the public one above.
+If you just want to benchmark cars and see their classes, you probably do not need this repository. Install the desktop app, use the public server, and register with the invite code shown in the app.
 
-This repository is for people who run a server of their own, for example a community that wants its own shared class list.
+## Who this repo is for
+
+This project is for people who want to run their own AC Bench server, for example:
+
+- a private community with its own rating list
+- a group wanting a shared, controlled class table
+- a maintainer who wants to host the backend and admin tools
+
+If you only want to use AC Bench as a player, use the desktop app and connect to an existing server.
 
 ## What the server does
 
-- Takes sign-ups by invite code only
-- Checks every upload and works out the lap scores itself instead of trusting the app
-- Compares results from different people and settles on one result per car and track
-- Keeps a class table that updates as new results come in, and answers the app's questions about which class a car is in
-- Serves a public page with the full list of cars and their classes
-- Gives the operator an admin dashboard and a few command line tools
+- Accepts sign-ups by invite code only
+- Validates every uploaded benchmark result
+- Recalculates car scores from the raw lap times
+- Combines results from multiple users into a single class table
+- Publishes a public page of cars and their classes
+- Provides a dashboard for admin operations
+- Answers desktop app lookups for car classes and tags
 
 ## How a result becomes a class
 
-1. Someone benchmarks a car in the desktop app. The app uploads the result with their personal key.
-2. The server checks the upload: the key must be valid, the benchmark setup must match the one the server asks for, and the lap times must make sense.
-3. The server recalculates the score from the lap times and compares it with what other people have uploaded for the same car.
-4. Each car ends up with one of three statuses:
-   - **verified**: enough different people agree on the time, or a trusted user has confirmed it
-   - **provisional**: only one person has uploaded it so far
-   - **disputed**: the uploads disagree, so the car isn't rated until more results come in
-5. Rated cars are ranked by lap time and split into classes at the natural gaps between them. The reply to an upload says which class each car in it belongs to.
+1. Someone runs a benchmark in the desktop app.
+2. The app uploads the result alongside its personal key.
+3. The server validates the upload: key validity, benchmark profile, track setup, lap plausibility, and consistency checks.
+4. The server recalculates the score from the lap times and compares it with other uploads for that same car.
+5. Each car ends up in one of three states:
+   - verified: enough different users agree, or a trusted user confirms it
+   - provisional: only one user has uploaded it so far
+   - disputed: the uploads disagree, so the result is not rated yet
+6. Cars are ranked by lap time and split into class bands at natural gaps.
 
-Classes are named 1A (the fastest), 1B, and so on up to 1Z, then 2A, 2B and onward. The desktop app writes the class into each car's tags as `#Pride-1A`, `#Pride-1B` and so on.
+Classes are named `1A`, `1B`, `1C`, and so on, moving up to `1Z`, then `2A`, `2B`, and so on. The desktop app writes these into car tags as `#Pride-1A`, `#Pride-1B`, and so on.
 
-A car's rating is how far behind the fastest car it is, so the fastest car is at 0%. As faster and slower cars are added, the class borders move to fit them, which means a car can change class over time. The class table has a version number that only goes up when the borders or class names actually change, so an app can tell whether it needs to look again.
+A car's rating is expressed relative to the fastest car in the table, so the fastest car sits at `0%` and slower cars are measured by how far behind it they are.
 
 ### Flags
 
-A car can carry a flag. These are advice for building grids and have no effect on whether a car is verified.
+A car may carry a flag, which is advisory for building grids and does not affect whether it is verified.
 
-- **borderline**: the car is very close to the edge of its class, so a small change could move it. Set by `tie_zone`.
-- **high variance**: the car's balance between the benchmark tracks is unusual for its class. A car that is simply slow in the same way as the other cars in its class isn't flagged, however far behind it is. Set by `variance_limit_pct`. In a class with only one or two cars there is little to compare against, so this flag is less reliable there.
+- `borderline`: the car is very close to the edge of its class
+- `high variance`: the car's performance varies unusually across tracks
 
-## Accounts
+## Accounts and permissions
 
-- Sign-up needs an invite code from the operator. Codes look like `XXXX-XXXX-XXXX-XXXX` and can be pasted in any case, with or without the hyphens.
-- Accounts are either `user` or `trusted`. A trusted user's results count as confirmed on their own.
-- There are no passwords. Each account has an API key that the app keeps. Keys are stored on the server as hashes only.
-- To use an account on another PC, the signed-in app asks the server for a single-use code that expires after a few minutes, and the new device swaps it for its own key. Each device has a separate key.
-- Banning an account blocks all of its devices.
+- Sign-up requires an invite code from the server operator
+- Codes look like `XXXX-XXXX-XXXX-XXXX` and can be pasted in any case
+- Accounts are either `user` or `trusted`
+- Trusted users may help confirm results more strongly
+- There are no passwords; each account has an API key that the app stores locally
+- Keys are stored on the server as hashes only
+- To use the same account on another PC, the app asks the server for a one-time code that expires after a few minutes
+- Banning an account blocks all of that user's devices
 
 ## How uploads are checked
 
-An upload is turned away unless all of these hold:
+An upload is rejected unless all of the following hold:
 
-- the API key is valid and the account isn't banned
+- the API key is valid and the account is not banned
 - the benchmark profile matches the one the server expects
 - the track and lap count are valid and the batch size is within limits
 - the lap times are plausible and consistent with each other
-- the game setup matches the operator's approved reference
+- the game setup matches the operator-approved reference
 
-The reference is a set of file fingerprints for the benchmark tracks and the game executable. It stops people uploading results from modified files or a different setup. The operator creates it with the desktop app (from a clean install) and loads the resulting track reference file, either with `set-env` or in the admin dashboard.
+The reference is a set of file fingerprints for the benchmark tracks and the game executable. This prevents players from uploading results from modified files or from a different setup.
 
-Cars are identified by the physics files that are actually installed (`data.acd` or the `data/` folder, plus `collider.ini`), not by folder name. A renamed or updated car mod can't inherit an old rating just because it kept its name.
+Cars are identified by the actual installed physics files (`data.acd` or the `data/` folder, plus `collider.ini`), not by folder name. That means a renamed or updated car mod does not silently inherit an old class.
 
-The benchmark conditions, such as which tracks are used, are chosen by the operator. The app asks the server for them, so nothing about them is fixed in the app.
+The benchmark conditions are chosen by the operator and delivered to the app via the server, so the app itself does not hard-code them.
 
 ## Settings
 
-Every setting can be changed with `config set`, and most of them in the admin dashboard. `config get` shows the current values.
+Most server settings can be changed with `config set`; `config get` shows the current values.
 
 | Setting | What it does |
 |---|---|
 | `tolerance_pct` | Two results agree if they are within this percentage of each other |
-| `min_confirmations` | How many different people must agree for a result to be verified |
-| `spread_limit_pct` | The most an upload's own timed laps may differ, slowest against fastest, as a percentage |
+| `min_confirmations` | How many different users must agree for a result to be verified |
+| `spread_limit_pct` | How far the fastest and slowest lap in one upload may differ |
 | `class_gap` | The widest a class may be, as a percentage of lap time |
-| `min_class_size` | The smallest class the server will make if it can avoid it |
-| `tie_zone` | How close to a class border a car must be to get the borderline flag |
+| `min_class_size` | The smallest class the server will make when possible |
+| `tie_zone` | How close to a class boundary a car must be to get the borderline flag |
 | `variance_limit_pct` | How unusual a car's track balance must be to get the high variance flag |
-| `include_provisional` | Also use single-user results when working out the classes |
-| `class_refresh_seconds` | The shortest time between two recalculations of the classes |
-| `export_max_age` | How many seconds the full class download may lag behind new uploads. 0 means always current |
+| `include_provisional` | Also use single-user results when calculating classes |
+| `class_refresh_seconds` | The minimum time between class recalculations |
+| `export_max_age` | How far behind the full class download may be; `0` means always current |
 | `rate_submits_per_hour` | Uploads allowed per account per hour |
 | `rate_register_per_hour` | Sign-up attempts allowed per address per hour |
 | `rate_lookups_per_hour` | Car lookups allowed per address per hour |
 
 ## Running your own server
 
-Docker Compose is the easiest way. The compose file builds the server straight from this repository.
+Docker Compose is the easiest way to get started.
 
 ```bash
 mkdir acbench-server && cd acbench-server
@@ -107,11 +122,15 @@ curl -L https://raw.githubusercontent.com/yiyirob973/AC-Bench-Server/HEAD/docker
 docker compose up -d --build
 ```
 
-The image is built from the repository's default branch. Set `ACB_REF` to build another branch, for example `ACB_REF=dev docker compose up -d --build`. If you cloned the repository and want to build your own copy of the files, set `ACB_CONTEXT=.` the same way. The server listens on port 8080. The database lives in a Docker volume, and `./import` is mounted read-only so you can drop in files such as the track reference before running admin commands.
+The image is built from the repository's default branch. To build another branch, set `ACB_REF`:
 
-Put the server behind a reverse proxy that handles HTTPS. Don't expose port 8080 to the internet directly, and don't run it without TLS anywhere other than your own machine, because API keys travel in a request header.
+```bash
+ACB_REF=dev docker compose up -d --build
+```
 
-First-time setup:
+Put the server behind a reverse proxy that handles HTTPS. Do not expose port `8080` directly to the internet, and do not run it without TLS except on a trusted private network.
+
+### First-time setup
 
 ```bash
 docker compose exec acbench python server.py init
@@ -119,7 +138,7 @@ docker compose exec acbench python server.py set-env --from /import/track_refere
 docker compose exec acbench python server.py invite --role user --uses 20
 ```
 
-Without Docker, the server needs only Python 3 and its standard library:
+The server also works without Docker, as long as Python 3 is installed:
 
 ```bash
 python server.py init
@@ -128,22 +147,26 @@ python server.py serve --port 8080
 
 ### Admin dashboard
 
-The dashboard lives at `/admin` and signs you in through PocketID (OpenID Connect). It lets you manage users and invites, look at disputed results, set the reference, change settings and rebuild the classes. Set these environment variables in the compose file:
+The admin dashboard lives at `/admin` and signs administrators in through PocketID (OpenID Connect). It allows you to manage users and invites, inspect disputed results, set the reference, adjust settings, and rebuild the class table.
+
+Required environment variables:
 
 | Variable | Meaning |
 |---|---|
-| `ACB_PUBLIC_URL` | The public address of your server, for example `https://bench.example.com` |
+| `ACB_PUBLIC_URL` | Public address of the server, e.g. `https://bench.example.com` |
 | `ACB_OIDC_ISSUER` | Your PocketID address |
-| `ACB_OIDC_CLIENT_ID` | The client ID you created in PocketID |
+| `ACB_OIDC_CLIENT_ID` | The client ID created in PocketID |
 | `ACB_OIDC_CLIENT_SECRET` | The client secret |
-| `ACB_ADMIN_GROUPS`, `ACB_ADMIN_SUBS` or `ACB_ADMIN_EMAILS` | Who may sign in. At least one is required |
-| `ACB_ADMIN_SESSION_HOURS` | How long a sign-in lasts (default 8) |
+| `ACB_ADMIN_GROUPS`, `ACB_ADMIN_SUBS` or `ACB_ADMIN_EMAILS` | Who may sign in; at least one is required |
+| `ACB_ADMIN_SESSION_HOURS` | How long a sign-in lasts; default is 8 |
 
-If any of the required variables is missing, the dashboard stays closed.
+If required variables are missing, the dashboard stays closed.
 
 ### Backups
 
-`backup.sh` makes a copy of the database while the server is running and keeps recent copies. Run it from cron, and copy the backups off the machine. If you restore a database by hand, restart the container afterwards.
+`backup.sh` copies the database while the server is running and keeps recent backups. Run it from cron and copy the backup files off the machine to a safe location.
+
+If you restore a database manually, restart the server afterward so it can rebuild any in-memory state.
 
 If you have several CPU cores, set `WEB_CONCURRENCY` in the compose file to run more worker processes.
 
@@ -157,19 +180,19 @@ docker compose down
 
 ## Admin commands
 
-Run these with `python server.py <command>` (or through `docker compose exec acbench`).
+Run these with `python server.py <command>` or through `docker compose exec acbench`.
 
 | Command | What it does |
 |---|---|
 | `serve [--host HOST] [--port PORT]` | Run the server |
 | `init` | Create the database |
 | `set-env --from FILE` | Set the approved reference from a track reference file |
-| `invite [--role user\|trusted] [--uses N]` | Make an invite code |
-| `create-user NAME [--role user\|trusted]` | Make an account directly |
+| `invite [--role user\|trusted] [--uses N]` | Generate an invite code |
+| `create-user NAME [--role user\|trusted]` | Create an account directly |
 | `ban NAME` / `unban NAME` | Block or unblock an account |
 | `backup --to PATH` | Copy the database |
 | `recompute-all` | Re-check every stored result |
-| `recalc-classes` | Rebuild the class table now. The server also does this by itself |
+| `recalc-classes` | Rebuild the class table now |
 | `stats` | Show a summary |
 | `disputed` | List disputed results |
 | `config get` / `config set KEY JSON_VALUE` | Read or change a setting |
@@ -178,50 +201,71 @@ Run these with `python server.py <command>` (or through `docker compose exec acb
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` and `/stats` | The public page listing cars and their classes |
-| `GET` | `/v1/health` | Check that the server is up |
-| `GET` | `/v1/config` | The accepted profile, limits and version information |
-| `GET` | `/v1/conditions` | The benchmark conditions the app should use |
+| `GET` | `/` and `/stats` | Public page listing cars and classes |
+| `GET` | `/v1/health` | Check whether the server is up |
+| `GET` | `/v1/config` | Accepted profile, limits, and version info |
+| `GET` | `/v1/conditions` | Benchmark conditions the app should use |
 | `POST` | `/v1/register` | Sign up with an invite code |
-| `POST` | `/v1/submit` | Upload results (needs the API key as a bearer token) |
-| `GET` | `/v1/classes` | The whole class table and every car, in one download |
+| `POST` | `/v1/submit` | Upload results; requires a bearer token API key |
+| `GET` | `/v1/classes` | Full class table and all car records |
 | `GET` | `/v1/cars/<car_hash>` | One car's record |
-| `POST` | `/v1/cars/lookup` | Records for many cars at once |
+| `POST` | `/v1/cars/lookup` | Look up many cars at once |
 | `POST` | `/v1/devices/link` | Get a code for signing in on another device |
-| `POST` | `/v1/devices/redeem` | Swap that code for a key on the new device |
+| `POST` | `/v1/devices/redeem` | Exchange that code for a key on the new device |
 
-An upload contains the `profile`, the `environments` and the `results`. The reply lists accepted and rejected entries with the reason for each rejection, and the current record for every car the upload touched: its class, status, flags and times.
+An upload contains the `profile`, `environments`, and `results`. The server replies with which entries were accepted or rejected and the current record for each car in that result set.
 
-A lookup is `POST /v1/cars/lookup` with `{"hashes": [...]}`, holding a list of lowercase SHA-256 car hashes. No key is needed. Cars the server doesn't know are left out of the reply, and the answer is always current.
+A lookup is `POST /v1/cars/lookup` with JSON like:
 
-## Privacy
+```json
+{"hashes": ["abc123...", "def456..."]}
+```
 
-The server stores user names, hashed API keys, uploaded results, short-lived rate-limit records and the class table. Admins who sign in to the dashboard also have their name and email address kept in the session and in a log of admin actions.
+The list contains lowercase SHA-256 car hashes. Cars the server does not know are omitted from the reply.
 
-## Limits
+## Privacy and limits
 
-- Results are reported by the users themselves, so they can't be fully trusted.
-- The reference fingerprints are public, so a determined cheater could try to fake them.
-- The checks that help are invite-only sign-up, agreement between users, trusted accounts, plausibility checks and bans.
-- Accounts that work together can still agree on fake results, so keep sign-ups limited to people you trust.
-- The server is built for a community, not for large commercial traffic.
+The server stores:
+
+- user names
+- hashed API keys
+- uploaded benchmark results
+- short-lived rate-limit information
+- the class table
+- admin names and email addresses for dashboard sign-ins
+
+This is a community benchmark service, not a general-purpose commercial traffic system.
+
+### Known limits
+
+- Results are reported by users themselves, so they cannot be fully trusted
+- The reference fingerprints are public, so a determined cheater could try to fake them
+- Invite-only sign-up, agreement between users, trusted accounts, plausibility checks, and bans help reduce abuse
+- Accounts that coordinate can still agree on fake data, so access should be limited to people you trust
+- The server is designed for communities, not large commercial traffic volumes
 
 ## Repository layout
 
 ```text
-server.py            the API, result merging and command line
-admin.py             the admin dashboard's sign-in and actions
-admin.html           the admin dashboard page
-ac_rating.py         splits cars into classes and names them
-stats.html           the public cars page
-branding/            the logo files, served by the server and used in this README
+server.py            API, result merging, and CLI
+admin.py             admin dashboard sign-in and actions
+admin.html           admin dashboard page
+ac_rating.py         car rating and class generation
+stats.html           public cars page
+branding/            logo files served by the server and used in this README
 Dockerfile
 docker-compose.yml
-backup.sh            database backup, meant to run from cron
+backup.sh            database backup utility for cron
 ```
 
-The server needs nothing beyond the Python standard library. The Docker image adds gunicorn.
+The server itself needs nothing beyond the Python standard library. The Docker image adds Gunicorn.
 
 ## Related
 
-The desktop app, [AC Bench Desktop](https://github.com/yiyirob973/AC-Bench-Desktop), is where benchmarks are run and cars are analysed. This repository is the server it talks to.
+The desktop app, [AC Bench Desktop](https://github.com/yiyirob973/AC-Bench-Desktop), is the client that runs the benchmark and uploads results to this server.
+
+## Disclaimer
+
+This project is provided as-is for community-driven Assetto Corsa benchmarking and class rating workflows. It is not affiliated with, authorized by, or endorsed by Kunos, Steam, or any official Assetto Corsa service.
+
+Use it at your own risk, and always keep backups of your database and configuration before making changes to the server or its reference data.
