@@ -2,226 +2,265 @@
   <img src="branding/ac-bench.png" alt="AC Bench logo" width="140">
 </p>
 
-<h1 align="center">AC Bench Server</h1>
+<h1 align="center">AC Bench Desktop</h1>
 
 <p align="center">
-  The shared class list for AC Bench: collects benchmark results, checks them and tells the app which class each car is in.
+  Benchmark your Assetto Corsa cars and compare them against everyone else.
 </p>
 
 ---
 
-AC Bench sorts Assetto Corsa cars into classes by how fast they are on a standard benchmark, so you can put together grids where the cars are evenly matched. People run the benchmark on their own PC with the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop) and upload the results. This server collects those results, checks them, combines them, and tells the app which class each car belongs to.
+AC Bench measures how fast AI drivers lap each of your installed cars under fixed conditions, uploads the times to an
+[AC Bench server](https://github.com/yiyirob973/AC-Bench-Server), and returns a performance class for every car. Those
+classes can then be written into your car list as tags so you can build balanced grids from a large mod collection.
+
+This project includes the Windows desktop app, the benchmark runner, and a small in-game app for Assetto Corsa.
+
+## What this does
+
+- Benchmarks each car under the same conditions selected by the server
+- Compares your results against other players using the same fixed rules
+- Assigns a class to each car from the server's published ratings
+- Writes those classes into `ui_car.json` as tags for easy filtering in Content Manager
+- Supports a public server or a private/self-hosted server
 
 ## Public server
 
-The public server is **https://bench.cauch.uk**. To use it, install the [AC Bench Desktop app](https://github.com/yiyirob973/AC-Bench-Desktop), enter that address on the Setup tab and register with an invite code. Its page with every car and its class is at the same address.
+A public server is available at: https://bench.cauch.uk
 
-## Do I need this repository?
+Enter this as the server address on the Setup tab. If you prefer, you can also run your own server using the
+[AC Bench Server project](https://github.com/yiyirob973/AC-Bench-Server).
 
-Most people don't. If you just want to benchmark cars or see their classes, use the desktop app and a server that already exists, like the public one above.
+## Requirements
 
-This repository is for people who run a server of their own, for example a community that wants its own shared class list.
+- Windows
+- Assetto Corsa (Steam)
+- [Custom Shaders Patch](https://acstuff.club/patch/) installed
+- A valid server address and invite code for registration
+- Python 3, only if running from source
 
-## What the server does
+## Quick start
 
-- Takes sign-ups by invite code only
-- Checks every upload and works out the lap scores itself instead of trusting the app
-- Compares results from different people and settles on one result per car and track
-- Keeps a class table that updates as new results come in, and answers the app's questions about which class a car is in
-- Serves a public page with the full list of cars and their classes
-- Gives the operator an admin dashboard and a few command line tools
+1. Download `AC-Bench.exe` from the [Releases page](../../releases).
+2. Run it without installation.
+3. On the Setup tab, enter your server address and registration details.
+4. Complete the required setup steps in order:
+   - Setup
+   - Vanilla check
+   - Benchmark
+   - Cars & ratings
+5. Run your benchmark and upload results.
 
-## How a result becomes a class
+If you want to run from source instead, use `run_gui.bat` or run:
 
-1. Someone benchmarks a car in the desktop app. The app uploads the result with their personal key.
-2. The server checks the upload: the key must be valid, the benchmark setup must match the one the server asks for, and the lap times must make sense.
-3. The server recalculates the score from the lap times and compares it with what other people have uploaded for the same car.
-4. Each car ends up with one of three statuses:
-   - **verified**: enough different people agree on the time, or a trusted user has confirmed it
-   - **provisional**: only one person has uploaded it so far
-   - **disputed**: the uploads disagree, so the car isn't rated until more results come in
-5. Rated cars are ranked by lap time and split into classes at the natural gaps between them. The reply to an upload says which class each car in it belongs to.
-
-Classes are named 1A (the fastest), 1B, and so on up to 1Z, then 2A, 2B and onward. The desktop app writes the class into each car's tags as `#Pride-1A`, `#Pride-1B` and so on.
-
-A car's rating is how far behind the fastest car it is, so the fastest car is at 0%. As faster and slower cars are added, the class borders move to fit them, which means a car can change class over time. The class table has a version number that only goes up when the borders or class names actually change, so an app can tell whether it needs to look again.
-
-### Flags
-
-A car can carry a flag. These are advice for building grids and have no effect on whether a car is verified.
-
-- **borderline**: the car is very close to the edge of its class, so a small change could move it. Set by `tie_zone`.
-- **high variance**: the car's balance between the benchmark tracks is unusual for its class. A car that is simply slow in the same way as the other cars in its class isn't flagged, however far behind it is. Set by `variance_limit_pct`. In a class with only one or two cars there is little to compare against, so this flag is less reliable there.
-
-## Accounts
-
-- Sign-up needs an invite code from the operator. Codes look like `XXXX-XXXX-XXXX-XXXX` and can be pasted in any case, with or without the hyphens.
-- Accounts are either `user` or `trusted`. A trusted user's results count as confirmed on their own.
-- There are no passwords. Each account has an API key that the app keeps. Keys are stored on the server as hashes only.
-- To use an account on another PC, the signed-in app asks the server for a single-use code that expires after a few minutes, and the new device swaps it for its own key. Each device has a separate key.
-- Banning an account blocks all of its devices.
-
-## How uploads are checked
-
-An upload is turned away unless all of these hold:
-
-- the API key is valid and the account isn't banned
-- the benchmark profile matches the one the server expects
-- the track and lap count are valid and the batch size is within limits
-- the lap times are plausible and consistent with each other
-- the game setup matches the operator's approved reference
-
-The reference is a set of file fingerprints for the benchmark tracks and the game executable. It stops people uploading results from modified files or a different setup. The operator creates it with the desktop app (from a clean install) and loads the resulting track reference file, either with `set-env` or in the admin dashboard.
-
-Cars are identified by the physics files that are actually installed (`data.acd` or the `data/` folder, plus `collider.ini`), not by folder name. A renamed or updated car mod can't inherit an old rating just because it kept its name.
-
-The benchmark conditions, such as which tracks are used, are chosen by the operator. The app asks the server for them, so nothing about them is fixed in the app.
-
-## Settings
-
-Every setting can be changed with `config set`, and most of them in the admin dashboard. `config get` shows the current values.
-
-| Setting | What it does |
-|---|---|
-| `tolerance_pct` | Two results agree if they are within this percentage of each other |
-| `min_confirmations` | How many different people must agree for a result to be verified |
-| `spread_limit_pct` | The most an upload's own timed laps may differ, slowest against fastest, as a percentage |
-| `class_gap` | The widest a class may be, as a percentage of lap time |
-| `min_class_size` | The smallest class the server will make if it can avoid it |
-| `tie_zone` | How close to a class border a car must be to get the borderline flag |
-| `variance_limit_pct` | How unusual a car's track balance must be to get the high variance flag |
-| `include_provisional` | Also use single-user results when working out the classes |
-| `class_refresh_seconds` | The shortest time between two recalculations of the classes |
-| `export_max_age` | How many seconds the full class download may lag behind new uploads. 0 means always current |
-| `rate_submits_per_hour` | Uploads allowed per account per hour |
-| `rate_register_per_hour` | Sign-up attempts allowed per address per hour |
-| `rate_lookups_per_hour` | Car lookups allowed per address per hour |
-
-## Running your own server
-
-Docker Compose is the easiest way. The compose file builds the server straight from this repository.
-
-```bash
-mkdir acbench-server && cd acbench-server
-curl -L https://raw.githubusercontent.com/yiyirob973/AC-Bench-Server/HEAD/docker-compose.yml -o docker-compose.yml
-docker compose up -d --build
+```bat
+python ac_bench_gui.py
 ```
 
-The image is built from the repository's default branch. Set `ACB_REF` to build another branch, for example `ACB_REF=dev docker compose up -d --build`. If you cloned the repository and want to build your own copy of the files, set `ACB_CONTEXT=.` the same way. The server listens on port 8080. The database lives in a Docker volume, and `./import` is mounted read-only so you can drop in files such as the track reference before running admin commands.
+## How it works
 
-Put the server behind a reverse proxy that handles HTTPS. Don't expose port 8080 to the internet directly, and don't run it without TLS anywhere other than your own machine, because API keys travel in a request header.
+Each car is benchmarked under the same rules and conditions chosen by the server. The server decides the tracks, lap
+count, AI settings, weather, and other benchmark parameters. The app fetches those conditions from the server and does
+not modify them locally.
 
-First-time setup:
+A car's score on a given track is based on the median of the timed laps, with the first lap discarded because it is a
+standing start. Because the conditions are fixed by the server, times from different cars and different PCs can be
+compared directly.
 
-```bash
-docker compose exec acbench python server.py init
-docker compose exec acbench python server.py set-env --from /import/track_reference.json
-docker compose exec acbench python server.py invite --role user --uses 20
-```
+The desktop app only measures lap times. The server then recomputes the scores from the uploaded data and decides the
+class for each car.
 
-Without Docker, the server needs only Python 3 and its standard library:
+## The tabs
 
-```bash
-python server.py init
-python server.py serve --port 8080
-```
+The status bar along the bottom is always visible and includes:
 
-### Admin dashboard
+- Stop
+- Progress indicator
+- Current state
+- Server conditions
+- Show log
 
-The dashboard lives at `/admin` and signs you in through PocketID (OpenID Connect). It lets you manage users and invites, look at disputed results, set the reference, change settings and rebuild the classes. Set these environment variables in the compose file:
+### 1. Setup
 
-| Variable | Meaning |
-|---|---|
-| `ACB_PUBLIC_URL` | The public address of your server, for example `https://bench.example.com` |
-| `ACB_OIDC_ISSUER` | Your PocketID address |
-| `ACB_OIDC_CLIENT_ID` | The client ID you created in PocketID |
-| `ACB_OIDC_CLIENT_SECRET` | The client secret |
-| `ACB_ADMIN_GROUPS`, `ACB_ADMIN_SUBS` or `ACB_ADMIN_EMAILS` | Who may sign in. At least one is required |
-| `ACB_ADMIN_SESSION_HOURS` | How long a sign-in lasts (default 8) |
+<p align="center">
+  <img src="docs/screenshots/setup.png" alt="Setup tab" width="760">
+</p>
 
-If any of the required variables is missing, the dashboard stays closed.
+Use this tab to configure:
 
-### Backups
+- Assetto Corsa game folder and Documents/Assetto Corsa folder
+- Required files to install/update for the benchmark and in-game app
+- Server address, your name, invite code, and registration
+- In-game tag syncing options
 
-`backup.sh` makes a copy of the database while the server is running and keeps recent copies. Run it from cron, and copy the backups off the machine. If you restore a database by hand, restart the container afterwards.
+### 2. Vanilla check
 
-If you have several CPU cores, set `WEB_CONCURRENCY` in the compose file to run more worker processes.
+<p align="center">
+  <img src="docs/screenshots/vanilla-check.png" alt="Vanilla check tab" width="760">
+</p>
 
-### Useful commands
+The vanilla check compares the benchmark tracks and `acs.exe` against the server's reference environment. Benchmarks run
+this check first and stop if anything differs, so everyone is measuring from the same clean setup.
 
-```bash
-docker compose logs -f acbench
-docker compose ps
-docker compose down
-```
+The server stores only fingerprints, not the original file list. If the check fails, verify your Steam install and
+remove any extra files from the track folders.
 
-## Admin commands
+### 3. Benchmark
 
-Run these with `python server.py <command>` (or through `docker compose exec acbench`).
+<p align="center">
+  <img src="docs/screenshots/benchmark.png" alt="Benchmark tab" width="760">
+</p>
 
-| Command | What it does |
-|---|---|
-| `serve [--host HOST] [--port PORT]` | Run the server |
-| `init` | Create the database |
-| `set-env --from FILE` | Set the approved reference from a track reference file |
-| `invite [--role user\|trusted] [--uses N]` | Make an invite code |
-| `create-user NAME [--role user\|trusted]` | Make an account directly |
-| `ban NAME` / `unban NAME` | Block or unblock an account |
-| `backup --to PATH` | Copy the database |
-| `recompute-all` | Re-check every stored result |
-| `recalc-classes` | Rebuild the class table now. The server also does this by itself |
-| `stats` | Show a summary |
-| `disputed` | List disputed results |
-| `config get` / `config set KEY JSON_VALUE` | Read or change a setting |
+The benchmark tab allows you to:
 
-## API
+- View the current server conditions
+- Filter which cars to test
+- Choose what to do with cars that already have results
+- Set pack size
+- Start a benchmark, do a dry run, or probe specific cars
 
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/` and `/stats` | The public page listing cars and their classes |
-| `GET` | `/v1/health` | Check that the server is up |
-| `GET` | `/v1/config` | The accepted profile, limits and version information |
-| `GET` | `/v1/conditions` | The benchmark conditions the app should use |
-| `POST` | `/v1/register` | Sign up with an invite code |
-| `POST` | `/v1/submit` | Upload results (needs the API key as a bearer token) |
-| `GET` | `/v1/classes` | The whole class table and every car, in one download |
-| `GET` | `/v1/cars/<car_hash>` | One car's record |
-| `POST` | `/v1/cars/lookup` | Records for many cars at once |
-| `POST` | `/v1/devices/link` | Get a code for signing in on another device |
-| `POST` | `/v1/devices/redeem` | Swap that code for a key on the new device |
+By default, a pack uploads its times as soon as it is complete. If an upload fails due to being offline, rate-limited,
+not registered, or another temporary problem, the benchmark continues and save files remain available for a later retry.
 
-An upload contains the `profile`, the `environments` and the `results`. The reply lists accepted and rejected entries with the reason for each rejection, and the current record for every car the upload touched: its class, status, flags and times.
+### 4. Cars & ratings
 
-A lookup is `POST /v1/cars/lookup` with `{"hashes": [...]}`, holding a list of lowercase SHA-256 car hashes. No key is needed. Cars the server doesn't know are left out of the reply, and the answer is always current.
+<p align="center">
+  <img src="docs/screenshots/cars-and-ratings.png" alt="Cars and ratings tab" width="760">
+</p>
 
-## Privacy
+This tab shows:
 
-The server stores user names, hashed API keys, uploaded results, short-lived rate-limit records and the class table. Admins who sign in to the dashboard also have their name and email address kept in the session and in a log of admin actions.
+- Local cars with lap-time results and status
+- Server cars with the current class assignment for installed cars
+- Options to rerun selected cars
+- Ways to apply server classes as tags
+- The ability to benchmark installed cars that do not yet have a server class
 
-## Limits
+## Car classes and tags
 
-- Results are reported by the users themselves, so they can't be fully trusted.
-- The reference fingerprints are public, so a determined cheater could try to fake them.
-- The checks that help are invite-only sign-up, agreement between users, trusted accounts, plausibility checks and bans.
-- Accounts that work together can still agree on fake results, so keep sign-ups limited to people you trust.
-- The server is built for a community, not for large commercial traffic.
+Classes are named like `1A` (top class), `1B` through `1Z`, then `2A` through `2Z`, `3A`, and so on. Tags are written
+as `#Pride-1A` and can be searched in Content Manager.
+
+Applying tags replaces the previous `#Pride-` tag for a car while leaving other tags untouched. Each car's
+`ui_car.json` file is backed up before it is changed.
+
+### Applying tags
+
+On the Cars & ratings tab, **Apply server classes as tags** finds installed cars, asks the server for their classes,
+and writes the class tag into each verified car. Provisional classes can be included if enabled in Settings. The bundled
+benchmark car is skipped.
+
+### Tags from inside the game
+
+The in-game app can also update tags while you play, so class tags stay current without opening the desktop app. This
+feature is disabled by default and can be turned on from the Setup tab.
+
+- It only runs during offline races and never during online or benchmark races.
+- It starts as soon as a race has loaded and writes any new class tags.
+- A class change on the server is picked up the next time you start a race.
+- The desktop app does not need to be running.
+- If the Custom Shaders Patch version does not provide `ac.checksumSHA256`, the in-game app reports that it is unavailable.
+
+## The in-game app
+
+The in-game app shows up in Assetto Corsa's app bar as **AC Bench**. During a benchmark race it logs the AI lap times
+for the desktop app. Outside of benchmark races it mostly stays idle, aside from the tag-sync feature if enabled.
+
+<p align="center">
+  <img src="docs/screenshots/in-game-idle.png" alt="In-game idle window" width="380">
+  &nbsp;
+  <img src="docs/screenshots/in-game-tags.png" alt="In-game tags window" width="380">
+</p>
+
+## Starting races
+
+Every race is started with Assetto Corsa's own **Start race** hotkey (the one in Content Manager > Settings > Assetto
+Corsa > Controls > System > Race). A key already assigned is always used and never changed. If no hotkey is assigned,
+the app assigns one. It never clicks buttons or manipulates the UI automatically.
+
+Custom Shaders Patch handles the hotkey in-game, so Content Manager does not need to be running.
+
+## Uploading results
+
+By default, each benchmark pack uploads its times as soon as all cars in that pack have run on every track. The server
+recomputes the scores and returns each car's class, which is displayed in the log and in the Cars & ratings tab.
+
+If an upload fails (for example because you are offline or not registered), the benchmark continues and the data is saved
+locally. The backup upload button on the Benchmark tab sends anything that has not been uploaded yet. Uploaded results are
+remembered so nothing is sent twice.
+
+## Rebenchmarking
+
+**Benchmark selected cars** reruns the cars you selected on tracks where they do not yet have a valid time. **Redo all
+tracks for selected** reruns those cars on every track.
+
+## Same account on another device
+
+On the device that is already registered, create a link code on the Setup tab. On the new device, choose the option to
+use the same account, enter the code, and sign in. The code works once and expires after a few minutes. Each device gets
+its own key for the same account.
+
+## Running a server
+
+Results are sent to an [AC Bench Server](https://github.com/yiyirob973/AC-Bench-Server), which validates them, combines
+results from multiple users, and publishes versioned class tables. That repository includes setup instructions, including
+how to create and load the track reference used by the vanilla check.
+
+The Vanilla check tab includes a button to create that reference from a clean install.
+
+## Building the executable
+
+The GitHub workflow in `.github/workflows/build.yml` builds `AC-Bench.exe` with [Nuitka](https://nuitka.net/), which
+compiles the Python code into a native Windows program.
+
+The executable bundles the app resources it needs, including the benchmark car and Lua app. Settings, results, and logs
+are stored next to the executable, or in `%LOCALAPPDATA%\AC-Bench` if the install folder is not writable.
+
+**Antivirus warnings:** a brand-new, unsigned program is sometimes flagged by antivirus software before it develops a
+reputation. Building with Nuitka reduces the chance of this, but it cannot eliminate it completely. If you prefer not
+to run the executable, you can run the project from source instead.
 
 ## Repository layout
 
 ```text
-server.py            the API, result merging and command line
-admin.py             the admin dashboard's sign-in and actions
-admin.html           the admin dashboard page
-ac_rating.py         splits cars into classes and names them
-stats.html           the public cars page
-branding/            the logo files, served by the server and used in this README
-Dockerfile
-docker-compose.yml
-backup.sh            database backup, meant to run from cron
+AC-Bench-Desktop/
+  README.md
+  run_gui.bat                  start the GUI from source on Windows
+  ac_bench_gui.py              the GUI
+  ac_lap_bench.py              builds and runs the benchmark races
+  ac_baseline.py               the fixed baseline
+  ac_conditions.py             benchmark conditions from the server
+  ac_carid.py                  identifies cars by physics hash
+  ac_car_classifier.py         reads car data
+  ac_rating.py                 scores results
+  ac_track_check.py            vanilla check of the tracks and acs.exe
+  ac_cloud.py                  server API: register, upload, link devices
+  ac_live.py                   live car lookups and tag writing
+  ac_tag_writer.py             writes the class tags
+  ac_input.py, ac_controls.py  the race start hotkey
+  ac_paths.py                  where files live
+  ac_theme.py                  window icon and logo
+  branding/
+    ac-bench.ico               exe and window icon
+    ac-bench.png               logo
+    header.png                 small logo for the window header
+  docs/screenshots/            screenshots used in this README
+  bundled_car/                 the TV car every race drives
+  apps/lua/ac_bench/           the in-game app
+    ac_bench.lua               lap logger
+    class_sync.lua             in-game class tagging
+    manifest.ini
+    icon.png                   app bar icon
 ```
 
-The server needs nothing beyond the Python standard library. The Docker image adds gunicorn.
+## Credits
 
-## Related
+The bundled TV car is by EmilioGQ: <https://www.overtake.gg/downloads/tv-car.45108/>. Every run drives it so results
+stay consistent between installs. It is never benchmarked itself and is never listed or tagged.
 
-The desktop app, [AC Bench Desktop](https://github.com/yiyirob973/AC-Bench-Desktop), is where benchmarks are run and cars are analysed. This repository is the server it talks to.
+## Disclaimer
+
+This project is provided as-is for Assetto Corsa benchmarking and class-tagging workflows. It is not affiliated with,
+authorized by, or endorsed by Kunos, Steam, or any official Assetto Corsa service.
+
+Use it at your own risk, and always back up any configuration or car data before applying class tags.

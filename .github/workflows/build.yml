@@ -1,0 +1,183 @@
+name: Build Portable Executable (Nuitka)
+
+# Builds ONE file, AC-Bench.exe, that needs no installation and leaves nothing behind: it unpacks into a temporary
+# folder while it runs, deletes it on exit, and keeps settings and results next to itself. Nuitka compiles the Python code to C and builds a native program, so the result does
+# not carry the PyInstaller bootloader that antivirus products recognise and flag. On every push to dev the exe is
+# also attached to the rolling "dev-latest" GitHub Release, so it can be downloaded directly (an Actions artifact is
+# always wrapped in a zip by GitHub). Settings and results are written next to the exe.
+# Start the workflow by hand with "folder" ticked to build a folder instead (only useful for debugging).
+on:
+  push:
+    branches: [ dev ]
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: 'Build a folder instead of a single exe (debugging only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read       # the build job can't write to the repository; only the publish job below can
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Check the files that get embedded are in the repository
+      shell: pwsh
+      run: |
+        $missing = @()
+        foreach ($p in 'template_race.ini', 'bundled_car', 'apps/lua/ac_bench/ac_bench.lua', 'ac_bench_gui.py', 'branding/ac-bench.ico') {
+          if (-not (Test-Path $p)) { $missing += $p }
+        }
+        if ($missing.Count -gt 0) {
+          Write-Error ("Missing from the repository (check .gitignore too): " + ($missing -join ', '))
+          exit 1
+        }
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install nuitka ordered-set zstandard
+        if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+    # The race template, benchmark car and Lua logger are shipped with the app; every ac_* module is listed because the
+    # app starts its jobs (benchmark, upload, vanilla check, tags) by running its own modules, which nothing imports directly.
+    - name: Build with Nuitka
+      shell: pwsh
+      env:
+        FOLDER: ${{ inputs.folder }}
+      run: |
+        # single exe by default. It unpacks into a temporary folder while it runs and deletes it when it closes
+        # (Nuitka's default), so nothing is left on the PC: the only files that stay are the ones beside the exe.
+        if ($env:FOLDER -eq 'true') { $mode = @('--standalone') }
+        else { $mode = @('--onefile') }
+        python -m nuitka @mode `
+          --msvc=latest `
+          --assume-yes-for-downloads `
+          --enable-plugin=tk-inter `
+          --windows-console-mode=disable `
+          --windows-icon-from-ico=branding/ac-bench.ico `
+          --output-dir=build `
+          --output-filename=AC-Bench.exe `
+          --product-name="AC Bench" `
+          --company-name="AC Bench" `
+          --file-description="AC Bench desktop app" `
+          --product-version=1.0.0 `
+          --file-version=1.0.0.${{ github.run_number }} `
+          --include-data-files=template_race.ini=template_race.ini `
+          --include-data-dir=bundled_car=bundled_car `
+          --include-data-dir=branding=branding `
+          --include-data-dir=apps=apps `
+          --include-module=ac_paths --include-module=ac_lap_bench --include-module=ac_cloud --include-module=ac_net `
+          --include-module=ac_conditions --include-module=ac_live --include-module=ac_tag_writer `
+          --include-module=ac_track_check --include-module=ac_baseline --include-module=ac_rating `
+          --include-module=ac_carid --include-module=ac_car_classifier --include-module=ac_input --include-module=ac_controls --include-module=ac_theme `
+          ac_bench_gui.py
+        if ($LASTEXITCODE -ne 0) { Write-Error "Nuitka build failed"; exit 1 }
+        $exe = if ($env:FOLDER -eq 'true') { 'build\ac_bench_gui.dist\AC-Bench.exe' } else { 'build\AC-Bench.exe' }
+        if (-not (Test-Path $exe)) { Write-Error "Expected $exe was not produced"; exit 1 }
+        "APP_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    # Runs the built app: embedded template/car/Lua logger present, every module importable, data folder writable
+    - name: Self-check the app
+      shell: pwsh
+      run: |
+        $p = Start-Process -FilePath $env:APP_EXE -ArgumentList "--ac-selfcheck" -Wait -PassThru `
+             -RedirectStandardOutput selfcheck_out.txt -RedirectStandardError selfcheck_err.txt
+        $p.WaitForExit()
+        Get-Content selfcheck_out.txt
+        Get-Content selfcheck_err.txt
+        if ($p.ExitCode -ne 0) { Write-Error "Self-check failed (exit $($p.ExitCode))"; exit 1 }
+        # settings and results must live next to the exe (portable), not in the temporary unpack folder
+        $exeDir = Split-Path -Parent (Resolve-Path $env:APP_EXE).Path
+        if (-not (Select-String -Path selfcheck_out.txt -SimpleMatch -Pattern $exeDir -Quiet)) {
+          Write-Error "The app's data folder is not the folder of the exe ($exeDir): see the self-check output above"
+          exit 1
+        }
+
+    # Runs one of the job modules the way the app does (the program starting itself with --ac-run)
+    - name: Smoke-test starting a job
+      shell: pwsh
+      run: |
+        $p = Start-Process -FilePath $env:APP_EXE -ArgumentList "--ac-run", "ac_conditions.py", "--help" -Wait -PassThru `
+             -RedirectStandardOutput job_out.txt -RedirectStandardError job_err.txt
+        $p.WaitForExit()
+        Get-Content job_out.txt
+        Get-Content job_err.txt
+        if ($p.ExitCode -ne 0 -or -not (Select-String -Path job_out.txt -Pattern "usage")) {
+          Write-Error "Starting a job from the app failed (exit $($p.ExitCode))"
+          exit 1
+        }
+
+    # a job process started by the app is told which folder holds the settings and results (AC_BENCH_DATA)
+    - name: Smoke-test the data folder given to jobs
+      shell: pwsh
+      run: |
+        $d = Join-Path $env:RUNNER_TEMP "acbench-data"
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        $env:AC_BENCH_DATA = $d
+        $p = Start-Process -FilePath $env:APP_EXE -ArgumentList "--ac-run", "ac_paths.py" -Wait -PassThru `
+             -RedirectStandardOutput paths_out.txt -RedirectStandardError paths_err.txt
+        $p.WaitForExit()
+        Get-Content paths_out.txt
+        Get-Content paths_err.txt
+        if ($p.ExitCode -ne 0 -or -not (Select-String -Path paths_out.txt -SimpleMatch -Pattern "DATA=$d" -Quiet)) {
+          Write-Error "A job did not use the data folder it was given"
+          exit 1
+        }
+
+    - name: Package
+      shell: pwsh
+      run: |
+        New-Item -ItemType Directory -Force -Path package | Out-Null
+        if ($env:APP_EXE -like '*.dist*') {
+          Compress-Archive -Path "build\ac_bench_gui.dist\*" -DestinationPath package\AC-Bench-Portable.zip
+        } else {
+          Copy-Item $env:APP_EXE package\AC-Bench.exe
+        }
+        Get-ChildItem package | ForEach-Object {
+          $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+          "$h  $($_.Name)" | Out-File -FilePath "$($_.FullName).sha256" -Encoding ascii
+        }
+        Get-ChildItem package
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AC-Bench-Portable
+        path: package/*
+        if-no-files-found: error
+
+  # Publishing is its own job: it runs no build tooling and the write permission exists only here.
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download the build
+      uses: actions/download-artifact@v4
+      with:
+        name: AC-Bench-Portable
+        path: package
+
+    # a direct download of AC-Bench.exe (the newest dev build replaces the previous one)
+    - name: Publish to the dev-latest release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        gh release delete dev-latest --yes --cleanup-tag || true
+        gh release create dev-latest package/* --prerelease --target "${{ github.sha }}" \
+          --title "Latest dev build" --notes "AC-Bench.exe built from commit ${{ github.sha }}. SHA-256 is in the .sha256 file."

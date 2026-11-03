@@ -1,0 +1,75 @@
+name: Build Portable Executable (PyInstaller, manual fallback)
+
+# Kept as a fallback only: PyInstaller output is flagged by many antivirus products. The normal build is build.yml (Nuitka).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Check the files that get embedded are in the repository
+      shell: pwsh
+      run: |
+        $missing = @()
+        foreach ($p in 'AC-Bench.spec', 'template_race.ini', 'bundled_car', 'apps/lua/ac_bench/ac_bench.lua') {
+          if (-not (Test-Path $p)) { $missing += $p }
+        }
+        if ($missing.Count -gt 0) {
+          Write-Error ("Missing from the repository (check .gitignore too): " + ($missing -join ', '))
+          exit 1
+        }
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install "pyinstaller>=6.9"
+        if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+    # The spec embeds template_race.ini, bundled_car and apps, and lists every ac_* module the app starts as a job
+    - name: Build Executable with PyInstaller
+      run: pyinstaller --noconfirm AC-Bench.spec
+
+    # Runs the built exe: embedded template/car/Lua logger present, every module importable, data folder writable
+    - name: Self-check the executable
+      shell: pwsh
+      run: |
+        $p = Start-Process -FilePath "dist\AC-Bench.exe" -ArgumentList "--ac-selfcheck" -Wait -PassThru `
+             -RedirectStandardOutput selfcheck_out.txt -RedirectStandardError selfcheck_err.txt
+        $p.WaitForExit()
+        Get-Content selfcheck_out.txt
+        Get-Content selfcheck_err.txt
+        if ($p.ExitCode -ne 0) { Write-Error "Self-check failed (exit $($p.ExitCode))"; exit 1 }
+
+    # Runs one of the job scripts the way the app does (the exe starting itself with --ac-run)
+    - name: Smoke-test starting a job
+      shell: pwsh
+      run: |
+        $p = Start-Process -FilePath "dist\AC-Bench.exe" -ArgumentList "--ac-run", "ac_conditions.py", "--help" -Wait -PassThru `
+             -RedirectStandardOutput job_out.txt -RedirectStandardError job_err.txt
+        $p.WaitForExit()
+        Get-Content job_out.txt
+        Get-Content job_err.txt
+        if ($p.ExitCode -ne 0 -or -not (Select-String -Path job_out.txt -Pattern "usage")) {
+          Write-Error "Starting a job from the exe failed (exit $($p.ExitCode))"
+          exit 1
+        }
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AC-Bench-Desktop-Executable-PyInstaller
+        path: dist/AC-Bench.exe
+        if-no-files-found: error
