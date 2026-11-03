@@ -1,5 +1,6 @@
 """
-Admin web UI for AC Bench Server, protected by OpenID Connect (PocketID). Standard library only.
+Admin web UI for AC Bench Server, protected by OpenID Connect (PocketID). Needs PyJWT with its crypto extra
+(requirements.txt) to check id_token signatures; everything else is the standard library.
 
 Routes (all under /admin; nothing here is reachable without a valid admin session):
     GET  /admin                     dashboard (redirects to /admin/login when signed out)
@@ -26,6 +27,11 @@ Fails closed: if anything above is missing, /admin answers 503 and nobody gets i
 import base64, hashlib, hmac, html, json, os, re, secrets, sys, time
 import urllib.error, urllib.parse, urllib.request
 from pathlib import Path
+
+try:   # verifies the id_token signature; without it the admin interface stays closed
+    import jwt
+except ImportError:   # pragma: no cover
+    jwt = None
 
 HERE = Path(__file__).resolve().parent
 SESSION_COOKIE, STATE_COOKIE = "acb_admin", "acb_oidc"
@@ -91,8 +97,30 @@ def settings():
     }
 
 
+LOOPBACK = ("localhost", "127.0.0.1", "::1")
+
+
+def _secure_url(url):
+    """https always; plain http only for a loopback address, so a local test setup still works."""
+    u = urllib.parse.urlsplit(url)
+    return bool(u.netloc) and (u.scheme == "https" or (u.scheme == "http" and (u.hostname or "") in LOOPBACK))
+
+
+def config_problem(s):
+    """Why the admin interface must stay closed, or None when the settings are usable."""
+    if not (s["origin"] and s["issuer"] and s["client_id"] and (s["subs"] or s["emails"] or s["groups"])):
+        return "admin interface is not configured"
+    if not _secure_url(s["origin"]):
+        return "ACB_PUBLIC_URL must use https"
+    if not _secure_url(s["issuer"]):
+        return "ACB_OIDC_ISSUER must use https"
+    if jwt is None:
+        return "PyJWT is not installed, so id_token signatures cannot be checked"
+    return None
+
+
 def configured(s):
-    return bool(s["origin"] and s["issuer"] and s["client_id"] and (s["subs"] or s["emails"] or s["groups"]))
+    return config_problem(s) is None
 
 
 def _cookie(s, name, value, max_age, path="/admin"):
@@ -158,7 +186,7 @@ def discovery(s):
     if str(doc.get("issuer", "")).rstrip("/") != s["issuer"]:
         raise LoginError(502, "identity provider issuer does not match ACB_OIDC_ISSUER")
     base = urllib.parse.urlsplit(s["issuer"])
-    for k in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint"):
+    for k in ("authorization_endpoint", "token_endpoint", "userinfo_endpoint", "jwks_uri"):
         u = urllib.parse.urlsplit(str(doc.get(k, "")))
         if (u.scheme, u.netloc) != (base.scheme, base.netloc):  # endpoints must live on the issuer's origin
             raise LoginError(502, "unexpected %s in discovery document" % k)
@@ -166,14 +194,41 @@ def discovery(s):
     return doc
 
 
-def _id_token_claims(tok):
-    # The id_token arrives straight from the token endpoint over TLS, so (OIDC Core 3.1.3.7) its signature
-    # need not be verified; iss/aud/exp/nonce are still checked and the identity comes from /userinfo.
+SIGNING_ALGS = ["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "EdDSA"]   # never "none" or an HMAC
+_jwks = {"t": 0.0, "keys": None}
+
+
+def _signing_keys(d, force=False):
+    if force or not _jwks["keys"] or time.time() - _jwks["t"] > 3600:
+        doc = _http(d["jwks_uri"])
+        keys = doc.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise LoginError(502, "identity provider published no signing keys")
+        _jwks.update(t=time.time(), keys=keys)
+    return _jwks["keys"]
+
+
+def _id_token_claims(tok, s, d):
+    """Check the id_token's signature against the provider's published keys, then its iss/aud/exp. The nonce and
+    the allow-list checks happen in finish_login."""
     try:
-        part = tok.split(".")[1]
-        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode("utf-8"))
-    except Exception:
-        raise LoginError(502, "identity provider returned an invalid id_token")
+        header = jwt.get_unverified_header(tok)
+        if header.get("alg") not in SIGNING_ALGS:
+            raise LoginError(403, "id_token uses an unsupported signing algorithm")
+        kid = header.get("kid")
+        for attempt in (0, 1):   # a rotated key shows up after one refetch
+            match = [k for k in _signing_keys(d, force=bool(attempt)) if kid is None or k.get("kid") == kid]
+            if match:
+                break
+        else:
+            raise LoginError(403, "id_token is signed with an unknown key")
+        key = jwt.PyJWK(match[0]).key
+        return jwt.decode(tok, key, algorithms=SIGNING_ALGS, audience=s["client_id"], issuer=s["issuer"],
+                          leeway=60, options={"require": ["exp", "iss", "aud", "sub"]})
+    except LoginError:
+        raise
+    except Exception as e:
+        raise LoginError(403, "id_token rejected: %s" % type(e).__name__)
 
 
 def start_login(db, s, now):
@@ -198,7 +253,7 @@ def allowed(s, claims):
     if claims.get("sub") in s["subs"]:
         return True
     email = claims.get("email")
-    if isinstance(email, str) and email.lower() in s["emails"] and claims.get("email_verified") is not False:
+    if isinstance(email, str) and email.lower() in s["emails"] and claims.get("email_verified") is True:
         return True
     groups = claims.get("groups")
     return isinstance(groups, list) and any(g in s["groups"] for g in groups if isinstance(g, str))
@@ -224,12 +279,7 @@ def finish_login(db, s, environ, query, now):
                 {"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"})
     if not tok.get("id_token") or not tok.get("access_token"):
         raise LoginError(502, "identity provider returned no tokens")
-    idc = _id_token_claims(tok["id_token"])
-    aud = idc.get("aud")
-    if str(idc.get("iss", "")).rstrip("/") != s["issuer"] or s["client_id"] not in (aud if isinstance(aud, list) else [aud]):
-        raise LoginError(403, "id_token issuer/audience mismatch")
-    if not isinstance(idc.get("exp"), (int, float)) or idc["exp"] < now - 60:
-        raise LoginError(403, "id_token expired")
+    idc = _id_token_claims(tok["id_token"], s, d)
     if not _same(idc.get("nonce", ""), row["nonce"]):
         raise LoginError(403, "id_token nonce mismatch")
     info = _http(d["userinfo_endpoint"], headers={"Authorization": "Bearer " + tok["access_token"], "Accept": "application/json"})
@@ -535,8 +585,9 @@ def dashboard():
 def handle(environ, db, cfg, ctx):
     """Called by server.route for every /admin path. Returns (status, body, headers)."""
     s = settings()
-    if not configured(s):
-        raise ctx.HttpError(503, "admin interface is not configured")
+    problem = config_problem(s)
+    if problem:
+        raise ctx.HttpError(503, problem)
     method, path = environ["REQUEST_METHOD"], environ.get("PATH_INFO", "")
     path = path.rstrip("/") or "/"
     now = int(time.time())

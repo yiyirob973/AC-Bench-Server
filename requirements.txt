@@ -1,0 +1,4 @@
+# Exact versions. For hash checking run:  pip-compile --generate-hashes requirements.txt -o requirements.lock
+# and install with:  pip install --require-hashes -r requirements.lock
+gunicorn==23.0.0
+PyJWT[crypto]==2.10.1

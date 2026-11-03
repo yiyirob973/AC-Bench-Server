@@ -1,9 +1,12 @@
-FROM python:3.12-slim
+# Pin the base image by digest for reproducible builds:  docker build --build-arg PYTHON_IMAGE=python:3.12-slim@sha256:<digest> .
+ARG PYTHON_IMAGE=python:3.12-slim
+FROM ${PYTHON_IMAGE}
 WORKDIR /app
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt \
+    && useradd --create-home acb && mkdir /data && chown acb /data
 COPY ac_rating.py server.py admin.py admin.html stats.html backup.sh /app/
 COPY branding/favicon.ico branding/logo.png /app/branding/
-RUN pip install --no-cache-dir gunicorn \
-    && useradd --create-home acb && mkdir /data && chown acb /data
 ENV ACB_DB=/data/acbench.db
 # tune without rebuilding: WEB_CONCURRENCY = worker processes (about one per CPU core), threads per worker below
 ENV WEB_CONCURRENCY=2 GUNICORN_CMD_ARGS="--worker-class gthread --threads 8 --timeout 30 --access-logfile -"

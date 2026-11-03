@@ -810,15 +810,31 @@ def authenticate(db, environ):
     return user
 
 
+def begin_write(db):
+    """Open a write transaction that holds the database write lock from the first statement on."""
+    if db.in_transaction:
+        db.commit()
+    db.execute("BEGIN IMMEDIATE")
+
+
 def rate_limit(db, who, kind, limit, window=3600):
     t = now()
-    n = db.execute("SELECT COUNT(*) AS n FROM events WHERE who=? AND kind=? AND ts>?", (who, kind, t - window)).fetchone()["n"]
-    if n >= limit:
-        raise HttpError(429, "rate limit reached, try again later")
-    db.execute("INSERT INTO events(ts, who, kind) VALUES(?,?,?)", (t, who, kind))
-    if secrets.randbelow(50) == 0:
-        db.execute("DELETE FROM events WHERE ts<?", (t - 86400,))
-    db.commit()
+    # Count and insert under one write lock so a burst of parallel requests can't all see room for one more.
+    begin_write(db)
+    try:
+        n = db.execute("SELECT COUNT(*) AS n FROM events WHERE who=? AND kind=? AND ts>?", (who, kind, t - window)).fetchone()["n"]
+        if n >= limit:
+            db.rollback()
+            raise HttpError(429, "rate limit reached, try again later")
+        db.execute("INSERT INTO events(ts, who, kind) VALUES(?,?,?)", (t, who, kind))
+        if secrets.randbelow(50) == 0:
+            db.execute("DELETE FROM events WHERE ts<?", (t - 86400,))
+        db.commit()
+    except HttpError:
+        raise
+    except BaseException:
+        db.rollback()
+        raise
 
 
 def public_config(cfg, db):
@@ -890,6 +906,14 @@ class MemoryLimiter:
             q.append(t)
 
 
+def _worker_count():
+    try:
+        return max(1, int(os.environ.get("WEB_CONCURRENCY", "1")))
+    except ValueError:
+        return 1
+
+
+WORKERS = _worker_count()
 _lookup_limiter = MemoryLimiter()
 
 
@@ -931,13 +955,26 @@ def handle_register(db, cfg, environ):
     if row["uses_left"] <= 0:
         raise HttpError(403, "this invite code has been used up or revoked")
     key = "acb_" + secrets.token_urlsafe(32)
+    # Take the write lock first, then spend the use with a conditional update. Two requests racing for the last
+    # use can't both pass: the loser sees zero rows changed. A taken name rolls the use back with everything else.
+    begin_write(db)
     try:
-        db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (name, sha(key), row["role"], now()))
+        spent = db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=? AND uses_left > 0",
+                           (code_hash,)).rowcount
+        if spent != 1:
+            db.rollback()
+            raise HttpError(403, "this invite code has been used up or revoked")
+        # the role is read after the use is spent, so a role change between the lookup and here can't slip through
+        role = db.execute("SELECT role FROM invites WHERE code_hash=?", (code_hash,)).fetchone()["role"]
+        db.execute("INSERT INTO users(name, key_hash, role, created) VALUES(?,?,?,?)", (name, sha(key), role, now()))
+        db.commit()
     except sqlite3.IntegrityError:
+        db.rollback()
         raise HttpError(409, "that name is taken")
-    db.execute("UPDATE invites SET uses_left = uses_left - 1 WHERE code_hash=?", (code_hash,))
-    db.commit()
-    return respond(201, {"api_key": key, "name": name, "role": row["role"]})
+    except BaseException:
+        db.rollback()
+        raise
+    return respond(201, {"api_key": key, "name": name, "role": role})
 
 
 LINK_TTL = 600   # seconds a device link code stays valid
@@ -971,11 +1008,22 @@ def handle_redeem(db, cfg, environ):
                              "(codes work once and for %d minutes)" % (LINK_TTL // 60))
     if row["banned"]:
         raise HttpError(403, "this account is banned")
-    db.execute("DELETE FROM device_links WHERE code_hash=?", (h,))
     key = "acb_" + secrets.token_urlsafe(32)
-    db.execute("INSERT INTO user_keys(key_hash, user_id, label, created) VALUES(?,?,?,?)",
-               (sha(key), row["user_id"], label.strip()[:40], now()))
-    db.commit()
+    # The delete is the claim on the code: only the request that actually removes the row gets a key.
+    begin_write(db)
+    try:
+        if db.execute("DELETE FROM device_links WHERE code_hash=? AND created>=?", (h, now() - LINK_TTL)).rowcount != 1:
+            db.rollback()
+            raise HttpError(403, "unknown or expired link code: create a new one on the signed-in device "
+                                 "(codes work once and for %d minutes)" % (LINK_TTL // 60))
+        db.execute("INSERT INTO user_keys(key_hash, user_id, label, created) VALUES(?,?,?,?)",
+                   (sha(key), row["user_id"], label.strip()[:40], now()))
+        db.commit()
+    except HttpError:
+        raise
+    except BaseException:
+        db.rollback()
+        raise
     return respond(201, {"api_key": key, "name": row["name"], "role": row["role"]})
 
 
@@ -1095,7 +1143,8 @@ def handle_lookup(db, cfg, environ):
     """Live data for just the cars a client has installed: POST {"hashes": [car physics hashes]} (public, like
     /v1/classes, but only the requested cars are returned and nothing is cached, so the data is always current).
     Cars the server knows nothing about are simply absent from "cars"."""
-    _lookup_limiter.check("ip:" + client_ip(environ, cfg), cfg["rate_lookups_per_hour"])
+    # every worker process keeps its own window, so each one gets its share of the limit
+    _lookup_limiter.check("ip:" + client_ip(environ, cfg), max(1, cfg["rate_lookups_per_hour"] // WORKERS))
     data = read_json(environ, cfg)
     hashes = data.get("hashes")
     if (not isinstance(hashes, list) or not 1 <= len(hashes) <= MAX_LOOKUP

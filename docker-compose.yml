@@ -11,8 +11,9 @@
 services:
   acbench:
     build:
-      # Builds the repository's default branch. To build another branch, set ACB_REF (for example ACB_REF=dev). To
-      # build a copy you cloned instead, set ACB_CONTEXT=. so it uses the files in this folder.
+      # Builds the repository's default branch. For a production deployment set ACB_REF to a release tag or a full
+      # commit hash (ACB_REF=<commit>) so the build can't change underneath you. Set ACB_CONTEXT=. to build a copy
+      # you cloned instead, which uses the files in this folder.
       context: "${ACB_CONTEXT:-https://github.com/yiyirob973/AC-Bench-Server.git}${ACB_REF:+#}${ACB_REF}"
       dockerfile: Dockerfile
     image: acbench-server:latest
