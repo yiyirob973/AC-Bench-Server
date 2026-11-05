@@ -102,8 +102,14 @@ LOOPBACK = ("localhost", "127.0.0.1", "::1")
 
 def _secure_url(url):
     """https always; plain http only for a loopback address, so a local test setup still works."""
-    u = urllib.parse.urlsplit(url)
-    return bool(u.netloc) and (u.scheme == "https" or (u.scheme == "http" and (u.hostname or "") in LOOPBACK))
+    try:
+        u = urllib.parse.urlsplit(url)
+        u.port   # raises on a malformed port
+    except ValueError:
+        return False
+    if not u.hostname or u.username or u.password or u.query or u.fragment or "?" in url or "#" in url:
+        return False
+    return u.scheme == "https" or (u.scheme == "http" and u.hostname in LOOPBACK)
 
 
 def config_problem(s):

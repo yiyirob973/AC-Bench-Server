@@ -61,6 +61,13 @@ class OidcTests(unittest.TestCase):
         self.assertFalse(admin.allowed(s, {"sub": "x", "email": "a@example.com", "email_verified": False}))
         self.assertFalse(admin.allowed(s, {"sub": "x", "email": "a@example.com"}))
 
+    def test_malformed_urls_rejected(self):
+        for bad in ("https://user:pw@id.example.com", "https://id.example.com/?x=1", "https://id.example.com/#f",
+                    "https://", "https:///path", "https://id.example.com:notaport", "id.example.com", "ftp://id.example.com"):
+            self.assertFalse(admin._secure_url(bad), bad)
+            self.assertIsNotNone(admin.config_problem(settings(issuer=bad)), bad)
+        self.assertTrue(admin._secure_url("https://id.example.com:8443/realm"))
+
     def test_http_config_stays_closed_except_loopback(self):
         self.assertIsNone(admin.config_problem(settings()))
         self.assertIn("https", admin.config_problem(settings(origin="http://bench.example.com")))
